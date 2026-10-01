@@ -1,0 +1,26 @@
+[project]
+name = "mojo-petsc4py"
+version = "0.1.0"
+description = "Krylov solvers and preconditioners from petsc4py, running in Mojo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lee Penkman", email = "leepenkman@gmail.com" }]
+keywords = ["mojo", "petsc", "petsc4py", "krylov", "gmres", "preconditioner"]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "petsc4py"]
+
+[project.urls]
+Homepage = "https://github.com/lee101/mojo-petsc4py"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
