@@ -147,6 +147,11 @@ def mp_vec_sqrtabs(x: Int, n: Int) abi("C"):
     VecSqrtAbs_Seq(p(x), n)
 
 
+@export("mp_vec_chop")
+def mp_vec_chop(x: Int, n: Int, tol: Float64) abi("C"):
+    VecChop_Seq(p(x), n, tol)
+
+
 @export("mp_vec_abs")
 def mp_vec_abs(x: Int, n: Int) abi("C"):
     VecAbs_Seq(p(x), n)
@@ -212,6 +217,11 @@ def mp_vec_axpbypcz(
 @export("mp_vec_waxpy")
 def mp_vec_waxpy(w: Int, alpha: Float64, x: Int, y: Int, n: Int) abi("C"):
     VecWAXPY_Seq(p(w), alpha, p(x), p(y), n)
+
+
+@export("mp_vec_tdot")
+def mp_vec_tdot(x: Int, y: Int, val: Int, n: Int) abi("C"):
+    VecTDot_Seq(p(x), p(y), p(val), n)
 
 
 @export("mp_vec_maxpy")
@@ -349,9 +359,9 @@ def mp_icc_symbolic(
 
 @export("mp_icc_contiguous_cholesky")
 def mp_icc_contiguous_cholesky(
-    ui: Int, udiag: Int, uj: Int, n: Int
+    ui: Int, udiag: Int, ujsrc: Int, uj: Int, n: Int
 ) abi("C"):
-    MatICCFreeSpaceContiguousCholesky(pi(ui), pi(udiag), pi(uj), n)
+    MatICCFreeSpaceContiguousCholesky(pi(ujsrc), pi(ui), pi(udiag), pi(uj), n)
 
 
 @export("mp_ordering_rcm")

@@ -222,6 +222,9 @@ class Mat:
         return int(self._nnz_used)
 
     def getInfo(self, info=None) -> dict:
+        """Return the nonzero counts.  `nz_used` is the stored count, which
+        includes entries that have been inserted but are zero."""
+        self._materialize()
         return {
             "nz_allocated": int(len(self._data)),
             "nz_used": int(self._nnz_used),
@@ -253,6 +256,42 @@ class Mat:
             self._data[:nnz].copy(),
         )
 
+    def setValuesCSR(self, indptr, indices, data=None) -> "Mat":
+        """Install a matrix directly from compressed sparse row arrays.
+
+        Upstream's signature is `setValuesCSR(I, V)` for the AIJ matrix it was
+        written for; here the sequential layout is CSR, so the three arrays are
+        the row starts, the column indices and the values, which is the same
+        data `getValuesCSR` returns.  This bypasses the pending-entry dict
+        entirely, which is what makes building a large matrix cheap.
+        """
+        irow = np.asarray(indptr, dtype=np.int64)
+        icol = np.asarray(indices, dtype=np.int64)
+        vals = np.zeros(0, dtype=np.float64) if data is None else np.asarray(
+            data, dtype=np.float64
+        )
+        if len(irow) != self._nrows + 1:
+            raise ValueError(
+                f"incompatible array sizes: indptr has {len(irow)} entries,"
+                f" {self._nrows + 1} are needed"
+            )
+        if len(icol) != len(vals):
+            raise ValueError(
+                f"incompatible array sizes: {len(icol)} indices but"
+                f" {len(vals)} values"
+            )
+        nnz = int(irow[-1])
+        if self._data.size < nnz:
+            self._data = np.zeros(nnz, dtype=np.float64)
+            self._icol = np.zeros(nnz, dtype=np.int64)
+            self._nnz_used = nnz
+        self._irow[:] = irow
+        self._icol[:nnz] = icol
+        self._data[:nnz] = vals
+        self._nnz_used = nnz
+        self._pending = None
+        return self
+
     def _locate(self, row: int, col: int):
         """Index of (row, col) in the CSR arrays, or (-1, -1) when absent."""
         if row < 0 or row >= self._nrows or col < 0 or col >= self._ncols:
@@ -279,6 +318,15 @@ class Mat:
         if values is not None:
             values[:] = out
             return values
+        return out
+
+    def _dense(self) -> np.ndarray:
+        """Return the matrix as a dense 2-D array."""
+        self._materialize()
+        out = np.zeros((self._nrows, self._ncols), dtype=np.float64)
+        for i in range(self._nrows):
+            for j in range(int(self._irow[i]), int(self._irow[i + 1])):
+                out[i, int(self._icol[j])] += float(self._data[j])
         return out
 
     def _materialize(self):
@@ -364,26 +412,57 @@ class Mat:
                 self._setValue(int(r), int(c), float(vals[i * len(cols) + j]), add)
 
     def setValueBlocked(self, rows, cols, value, addv=None) -> None:
+        """Set every entry of the `rows` x `cols` block to a single `value`.
+
+        Block size 1 here, so this is the diagonal-set shorthand: the block is
+        the outer product of the two index lists, exactly as
+        `MatSetValueBlocked` is `MatSetValues` with `bs * bs` copies per entry.
+        """
+        rows = list(rows)
+        cols = list(cols)
         add = addv is not None
-        for r, c in zip(rows, cols):
-            self._setValue(int(r), int(c), float(value), add)
+        for i, r in enumerate(rows):
+            for c in cols:
+                self._setValue(int(r), int(c), float(value), add)
 
     def setValuesBlocked(self, rows, cols, values, addv=None) -> None:
-        for r, c, v in zip(rows, cols, values):
-            self._setValue(int(r), int(c), float(v), addv is not None)
+        """Set the `rows` x `cols` block, `values` laid out over the outer
+        product, as upstream's `MatSetValuesBlocked` takes them."""
+        rows = list(rows)
+        cols = list(cols)
+        vals = list(values)
+        need = len(rows) * len(cols)
+        if len(vals) < need:
+            raise ValueError(
+                f"incompatible array sizes: ni={len(rows)}, nj={len(cols)},"
+                f" nv={len(vals)}; at least {need} values are needed"
+            )
+        add = addv is not None
+        for i, r in enumerate(rows):
+            for j, c in enumerate(cols):
+                self._setValue(
+                    int(r), int(c), float(vals[i * len(cols) + j]), add
+                )
 
     # ---------------------------------------------------------- algebra
     def _out(self, x: Vec) -> Vec:
-        if len(x.getArray()) != self._nrows:
+        """`y = A @ x` takes a column-length vector and returns a row-length
+        one."""
+        if len(x.getArray()) != self._ncols:
             raise ValueError(
-                f"incompatible sizes: matrix {self._nrows} rows, vector"
+                f"incompatible sizes: matrix {self._ncols} columns, vector"
                 f" {len(x.getArray())}"
             )
         return Vec().createSeq(self._nrows, x.getBlockSize())
 
     def _outT(self, x: Vec) -> Vec:
-        """The output of the transposed product is indexed by column."""
-        self._out(x)
+        """The output of the transposed product is indexed by column, and the
+        input is indexed by row."""
+        if len(x.getArray()) != self._nrows:
+            raise ValueError(
+                f"incompatible sizes: matrix {self._nrows} rows, vector"
+                f" {len(x.getArray())}"
+            )
         return Vec().createSeq(self._ncols, x.getBlockSize())
 
     def _check_y(self, y: Vec, n: int) -> Vec:
@@ -444,9 +523,11 @@ class Mat:
         return out
 
     def createVecLeft(self) -> Vec:
+        """A vector a matrix-vector product can be applied to."""
         return Vec().createSeq(self._nrows)
 
     def createVecRight(self) -> Vec:
+        """A vector for the transposed product, indexed by column."""
         return Vec().createSeq(self._ncols)
 
     def __call__(self, x, y=None):
@@ -489,7 +570,10 @@ class Mat:
         lib().mp_mat_scale(addr(self._data), int(len(self._data)), float(alpha))
 
     def equal(self, mat, tol: float = 0.0) -> bool:
+        """Compare the stored entries, so the pending dict is flushed first."""
         other = mat
+        self._materialize()
+        other._materialize()
         if self._nrows != other._nrows or self._ncols != other._ncols:
             return False
         if not np.array_equal(self._irow, other._irow):
@@ -499,18 +583,19 @@ class Mat:
         return bool(np.allclose(self._data, other._data, rtol=0, atol=tol))
 
     def isSymmetric(self, tol: float = 0.0) -> bool:
-        """Return whether the matrix is symmetric within `tol`."""
-        t = _transpose(self)
-        n = self._nrows
-        if n != self._ncols:
+        """Return whether the matrix equals its own transpose within `tol`."""
+        if self._nrows != self._ncols:
             return False
-        a = _dense(self)
-        b = _dense(t)
-        return bool(np.allclose(a, b.T, rtol=0, atol=tol))
+        return bool(np.allclose(self._dense(), _transpose(self)._dense(),
+                                rtol=0, atol=tol))
 
     def isTranspose(self, mat=None, tol: float = 0.0) -> bool:
+        """Return whether this matrix is the transpose of `mat` within `tol`."""
         other = self if mat is None else mat
-        return _transpose(other).isSymmetric(tol)
+        if self._nrows != other._ncols or self._ncols != other._nrows:
+            return False
+        return bool(np.allclose(self._dense(), _transpose(other)._dense(),
+                                rtol=0, atol=tol))
 
     def __matmul__(self, x):
         return self.mult(x)
@@ -526,12 +611,6 @@ class Mat:
         return out
 
 
-def _dense(m: Mat) -> np.ndarray:
-    out = np.zeros((m._nrows, m._ncols), dtype=np.float64)
-    for i in range(m._nrows):
-        for j in range(int(m._irow[i]), int(m._irow[i + 1])):
-            out[i, int(m._icol[j])] += m._data[j]
-    return out
 
 
 def _transpose(m: Mat) -> Mat:
@@ -566,8 +645,8 @@ def _matmul(a: Mat, b: Mat) -> Mat:
         raise ValueError(
             f"incompatible sizes: {a.getSize()} times {b.getSize()}"
         )
-    ad = _dense(a)
-    bd = _dense(b)
+    ad = a._dense()
+    bd = b._dense()
     return from_dense(ad @ bd)
 
 
@@ -579,7 +658,7 @@ def from_dense(array, mat=None) -> Mat:
     n, m = arr.shape
     out = mat if mat is not None else Mat()
     per_row = max(1, int(np.count_nonzero(arr[0])) if n else 1)
-    out.createSeqAIJ(min(n, m), nnz=per_row)
+    out.createSeqAIJ((n, m), nnz=per_row)
     out._nrows = n
     out._ncols = m
     counts = np.count_nonzero(arr, axis=1).astype(np.int64)

@@ -103,6 +103,10 @@ class Vec:
         lib().mp_vec_copy(addr(self._array), addr(target._array), self.getSize())
         return target
 
+    def chop(self, tol) -> None:
+        """Set entries with magnitude below `tol` to zero, the rest to +/-1."""
+        lib().mp_vec_chop(addr(self._check()), self._n(), float(tol))
+
     def destroy(self) -> "Vec":
         self._array = None
         return self
@@ -200,6 +204,19 @@ class Vec:
         val = np.zeros(1, dtype=np.float64)
         self._peer(other)
         lib().mp_vec_dot(
+            addr(self._check()), addr(other._check()), addr(val), len(self._array)
+        )
+        return float(val[0])
+
+    def tDot(self, other: "Vec") -> float:
+        """The indefinite dot product y^T x, which skips the conjugate.
+
+        For a real build this is `dot` with the arguments swapped, as upstream
+        notes; it is kept separate so a complex build has somewhere to differ.
+        """
+        val = np.zeros(1, dtype=np.float64)
+        self._peer(other)
+        lib().mp_vec_tdot(
             addr(self._check()), addr(other._check()), addr(val), len(self._array)
         )
         return float(val[0])

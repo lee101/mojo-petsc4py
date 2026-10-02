@@ -320,6 +320,29 @@ def test_max_pointwise_divide():
     )
 
 
+@pytest.mark.parametrize("tol", [0.0, 1e-12, 0.5, 1.0, 2.0, 1e9])
+def test_chop(tol):
+    """`chop` zeroes entries below `tol` and leaves the survivors untouched.
+
+    The boundary matters: upstream compares strictly, so `chop(0.0)` is a
+    no-op and an entry whose magnitude is exactly `tol` is kept.
+    """
+    ref, mojo, a = pairs()
+    ref.chop(tol)
+    mojo.chop(tol)
+    same(ref.getArray(), mojo.getArray())
+    assert np.array_equal(ref.getArray(), np.where(np.abs(a) < tol, 0.0, a))
+
+
+def test_tdot_matches_dot_for_real_scalars():
+    """Upstream notes the indefinite form equals the dot for real scalars."""
+    ref, mojo, a = pairs()
+    ref_b, mojo_b, _ = pairs(seed=SEED + 1)
+    assert ref.tDot(ref_b) == pytest.approx(mojo.tDot(mojo_b), rel=TOL)
+    assert ref.tDot(ref_b) == pytest.approx(ref.dot(ref_b), rel=TOL)
+    assert mojo.tDot(mojo_b) == pytest.approx(mojo.dot(mojo_b), rel=TOL)
+
+
 def test_duplicate_and_copy():
     ref, mojo, a = pairs()
     r = ref.copy()

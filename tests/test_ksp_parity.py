@@ -1,12 +1,5 @@
 """Parity of the Krylov solvers against real upstream petsc4py.
 
-`bcgs` is marked xfail: the port's BiCGStab is a line-by-line transcription of
-`src/ksp/ksp/impls/bcgs/bcgs.c` and agrees with an independent NumPy
-transcription of the same algorithm, but it does not reproduce upstream's
-iterate -- the residual histories separate on the first iteration, so the
-preconditioner placement upstream applies inside `KSPSolve_BCGS` is not the one
-this transcription implements.  See the README's coverage section.
-
 Both sides run the same matrix, right-hand side, tolerances and preconditioner,
 and are compared on the iterate, the iteration count, the converged reason and
 the reported residual norm.  PETSc's `KSPSolve` is a thin wrapper over the same
@@ -133,9 +126,7 @@ def true_residual(a, b, x):
     return np.linalg.norm(b - a @ x)
 
 
-@pytest.mark.parametrize(
-    "ksp_type", ["cg", "gmres", "fgmres", pytest.param("bcgs", marks=pytest.mark.xfail)]
-)
+@pytest.mark.parametrize("ksp_type", ["cg", "gmres", "fgmres", "bcgs"])
 def test_no_preconditioner(ksp_type):
     a = spd(60, seed=1)
     b = np.random.default_rng(2).normal(size=60)
@@ -147,9 +138,7 @@ def test_no_preconditioner(ksp_type):
     assert true_residual(a, b, got["x"]) < 1e-8
 
 
-@pytest.mark.parametrize(
-    "ksp_type", ["cg", "gmres", "fgmres", pytest.param("bcgs", marks=pytest.mark.xfail)]
-)
+@pytest.mark.parametrize("ksp_type", ["cg", "gmres", "fgmres", "bcgs"])
 def test_jacobi_left(ksp_type):
     a = spd(60, seed=3)
     b = np.random.default_rng(4).normal(size=60)

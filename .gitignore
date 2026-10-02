@@ -4,5 +4,7 @@ build/*.o
 __pycache__/
 *.so
 *.pyc
+*.o
 .pytest_cache/
 .venv/
+*.egg-info/

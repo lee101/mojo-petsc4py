@@ -458,9 +458,10 @@ def KSPSolve_BCGS(
         KSP_PCApplyBAorAB(
             pci, pcf, pstmp, pc_side, arow, acol, adata, n, S, T, R
         )  # t <- M⁻¹ A s
-        # VecDotNorm2(S, T, &d1, &d2)
+        # VecDotNorm2(S, T, &d1, &d2): d1 is S.T, d2 is the squared norm of the
+        # SECOND argument, T -- not of S
         d1 = _dot(S, T, n)
-        d2 = _snorm2(S, n)
+        d2 = _snorm2(T, n)
         if d2 == 0.0:
             d1 = _dot(S, S, n)
             if d1 != 0.0:
@@ -503,12 +504,21 @@ def KSPSolve_BCGS(
 def KSPGMRESModifiedGramSchmidtOrthogonalization(
     vv: Int, hh: Ptr, hes: Ptr, m: Int, it: Int, n: Int
 ):
-    """borthog.c KSPGMRESModifiedGramSchmidtOrthogonalization."""
+    """borthog.c KSPGMRESModifiedGramSchmidtOrthogonalization.
+
+    Upstream walks `hh` and `hes` with two incrementing pointers seeded at
+    column `it`, so each projection lands in both HH(j,it) and HES(j,it).
+    Both are needed: HH drives the Givens rotations and the solution build,
+    HES the least-squares work.
+    """
     var k = 0
     while k <= it:
-        var d = _dot(_vv(vv, k, n), _vv(vv, it + 1, n), n)
+        var d = _dot(_vv(vv, it + 1, n), _vv(vv, k, n), n)
+        # HH(a, b) = hh + b * (max_k + 2) + a
+        hh.unsafe_store(it * (m + 2) + k, d)
         # HES(a, b) = hes + b * (max_k + 1) + a
         hes.unsafe_store(it * (m + 1) + k, d)
+        # vv(it+1) <- vv(it+1) - HH(j, it) vv(j)
         VecAXPY_Seq(_vv(vv, it + 1, n), -d, _vv(vv, k, n), n)
         k += 1
 
@@ -928,28 +938,20 @@ def _sign(x: Float64) -> Int:
 
 
 def _dot(x: Ptr, y: Ptr, n: Int) -> Float64:
-    var s = 0.0
-    var i = 0
-    while i < n:
-        s += x.unsafe_load(i) * y.unsafe_load(i)
-        i += 1
-    return s
+    return simdvec.dot(x, y, n)
 
 
 def _snorm2(x: Ptr, n: Int) -> Float64:
     """The `rval` half of VecDotNorm2: the squared norm of x."""
-    var r = 0.0
-    var i = 0
-    while i < n:
-        r += x.unsafe_load(i) * x.unsafe_load(i)
-        i += 1
-    return r
+    return simdvec.norm2(x, n)
 
 
 def _mdot_vv(base: Int, k: Int, other: Int, res: Ptr, n: Int):
     """VecMDot(VV(k), k + 1, &VV(0), out) over a flat basis block.
 
-    `VecMDot` with `nv = k + 1` produces entries 0..k, so the loop is exclusive.
+    `VecMDot` with `nv = k + 1` fills `out[0..k]`, one entry per basis vector,
+    so the loop covers all of them.  The caller passes `k = it + 1`, which is
+    why the last index is `k - 1`.
     """
     var j = 0
     while j < k:
@@ -959,46 +961,24 @@ def _mdot_vv(base: Int, k: Int, other: Int, res: Ptr, n: Int):
 
 def _maxpy_vv(y: Ptr, alpha: Ptr, base: Int, nvec: Int, n: Int):
     """VecMAXPY(y, nvec, alpha, &VV(0)) over a flat basis block."""
-    var k = 0
-    while k < nvec:
-        var yk = _vv(base, k, n)
-        var a = alpha.unsafe_load(k)
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, y.unsafe_load(i) + a * yk.unsafe_load(i))
-            i += 1
-        k += 1
+    simdvec.maxpy(y, alpha, n, nvec, base)
 
 
 def _maxpy_vv_n(y: Ptr, alpha: Ptr, base: Int, nvec: Int, n: Int):
     """VecMAXPBY(y, nvec, alpha, 0, &VV(0)).
 
-    beta = 0 replaces `y` with the sum, so the accumulation still runs over
-    every term; it just does not add the old `y` in.
+    beta = 0 replaces `y` with the sum, so the destination is cleared first and
+    every term accumulates on top of that.
     """
-    var i = 0
-    while i < n:
-        y.unsafe_store(i, 0.0)
-        i += 1
-    var k = 0
-    while k < nvec:
-        var yk = _vv(base, k, n)
-        var a = alpha.unsafe_load(k)
-        i = 0
-        while i < n:
-            y.unsafe_store(i, y.unsafe_load(i) + a * yk.unsafe_load(i))
-            i += 1
-        k += 1
+    simdvec.zero(y, n)
+    simdvec.maxpy(y, alpha, n, nvec, base)
 
 
 def _normalize(x: Ptr, n: Int) -> Float64:
     """VecNormalize, returning the norm."""
     var z = VecNorm2(x, n)
     if z > 0.0:
-        var i = 0
-        while i < n:
-            x.unsafe_store(i, x.unsafe_load(i) / z)
-            i += 1
+        simdvec.normalize_inplace(x, n, z)
     return z
 
 

@@ -144,6 +144,12 @@ class KSP:
         self._rhs = None
         self._sol = None
         self._setupcalled = False
+        self._cfg = None
+        self._cfgi = None
+        self._work = None
+        self._vv = None
+        self._prevec = None
+        self._hs = None
 
     # ---------------------------------------------------------- lifecycle
     def create(self, comm=None) -> "KSP":
@@ -289,6 +295,36 @@ class KSP:
         self._pc.setUp()
         self._setupcalled = True
 
+    # ---------------------------------------------------------- scratch
+    # The driver keeps every buffer it needs in caller-owned arrays, so a solve
+    # whose size, restart and tolerances are unchanged reuses the ones it
+    # already has instead of allocating and zeroing several megabytes per
+    # call.  PETSc allocates these in KSPSetUp for the same reason.
+    def _ensure(self, nwork: int, nvec: int, hs_size: int):
+        """Grow the driver's scratch if it no longer fits, and hand it back.
+
+        A vector block that a previous solve did not write end to end is zeroed
+        on reuse; an exact fit is left alone, since in that case the driver
+        overwrote every entry it went on to read.  PETSc allocates the same
+        blocks in `KSPSetUp` and reuses them for every solve, which is what
+        this mirrors.
+        """
+        if self._work is None or len(self._work) < nwork:
+            self._work = np.zeros(nwork, dtype=np.float64)
+        elif len(self._work) > nwork:
+            self._work[:nwork] = 0.0
+        if nvec:
+            if self._vv is None or len(self._vv) < nvec:
+                self._vv = np.zeros(nvec, dtype=np.float64)
+            elif len(self._vv) > nvec:
+                self._vv[:nvec] = 0.0
+        if hs_size:
+            if self._hs is None or len(self._hs) < hs_size:
+                self._hs = np.zeros(hs_size, dtype=np.float64)
+            elif len(self._hs) > hs_size:
+                self._hs[:hs_size] = 0.0
+        return self._work, self._vv, self._hs
+
     # ---------------------------------------------------------- solve
     def solve(self, b: Vec, x: Vec) -> None:
         """Solve A x = b, taking the right-hand side from `b` and returning the
@@ -323,15 +359,13 @@ class KSP:
 
         if self._type in (KSPType.GMRES, KSPType.FGMRES):
             mk = self._restart
-            work = np.zeros(2 * n, dtype=np.float64)
-            vv = np.zeros((mk + 1) * n, dtype=np.float64)
             # HH (max_k + 2)*(max_k + 1), HES (max_k + 1)^2, CC and SS
             # max_k + 1 each, RS and ORTHOG max_k + 2 each; see ksp.mojo
-            hs = np.zeros(
+            hs_size = (
                 (mk + 2) * (mk + 1) + (mk + 1) * (mk + 1)
-                + 2 * (mk + 1) + 2 * (mk + 2),
-                dtype=np.float64,
+                + 2 * (mk + 1) + 2 * (mk + 2)
             )
+            work, vv, hs = self._ensure(2 * n, (mk + 1) * n, hs_size)
             if self._type == KSPType.GMRES:
                 lib().mp_ksp_solve_gmres(
                     n, addr(am.irow), addr(am.icol), addr(am.data),
@@ -340,7 +374,7 @@ class KSP:
                     addr(b.getArray()), addr(x.getArray()),
                 )
             else:
-                prevec = np.zeros((mk + 2) * n, dtype=np.float64)
+                prevec = self._ensure(0, (mk + 2) * n, 0)[1]
                 lib().mp_ksp_solve_fgmres(
                     n, addr(am.irow), addr(am.icol), addr(am.data),
                     addr(self._pc._pci_block(n)), addr(pcf), addr(pstmp),
@@ -348,7 +382,7 @@ class KSP:
                     addr(cfgi), addr(b.getArray()), addr(x.getArray()),
                 )
         else:
-            work = np.zeros(7 * n, dtype=np.float64)
+            work, _vv, _hs = self._ensure(7 * n, 0, 0)
             entry = (
                 lib().mp_ksp_solve_cg if self._type == KSPType.CG
                 else lib().mp_ksp_solve_bcgs
@@ -377,14 +411,22 @@ class KSP:
     def _state(self, n: int):
         """Build the scalar blocks the Mojo driver reads; see the ksp.mojo
         docstring for the layout."""
-        cfg = np.zeros(16 + self._max_it + 2, dtype=np.float64)
+        size = 16 + self._max_it + 2
+        if self._cfg is None or len(self._cfg) < size:
+            self._cfg = np.zeros(size, dtype=np.float64)
+        cfg = self._cfg
+        # the residual history is the one part of this block the driver only
+        # appends to, so it is cleared rather than left from the last solve
+        cfg[9:9 + self._max_it + 2] = 0.0
         cfg[0] = self._rtol
         cfg[1] = self._atol
         cfg[2] = self._divtol
         cfg[3] = self._haptol
         cfg[4] = self._breakdowntol
         cfg[6] = 0.0
-        cfgi = np.zeros(16, dtype=np.int64)
+        if self._cfgi is None:
+            self._cfgi = np.zeros(16, dtype=np.int64)
+        cfgi = self._cfgi
         cfgi[0] = self._normtype
         cfgi[1] = self._pc_side
         cfgi[2] = self._guess_zero

@@ -155,6 +155,54 @@ def test_setvalues_fills_the_outer_product():
         mojo.setValues([0, 1], [0, 1, 2], [1.0, 2.0, 3.0])
 
 
+def test_setvaluescsr_roundtrips_and_matches_upstream():
+    """`setValuesCSR` installs a CSR triple directly and round-trips through
+    `getValuesCSR`; the resulting matrix matches upstream built the same way."""
+    a = laplacian(5)
+    indptr, indices, data = [], [], []
+    for r in range(a.shape[0]):
+        indptr.append(len(indices))
+        for c in range(a.shape[1]):
+            if a[r, c] != 0.0:
+                indices.append(c)
+                data.append(a[r, c])
+    indptr.append(len(indices))
+    indptr = np.array(indptr, dtype=np.int32)
+    indices = np.array(indices, dtype=np.int32)
+    data = np.array(data, dtype=np.float64)
+
+    ref = Ref.Mat().create()
+    ref.setSizes([5, 5])
+    ref.setType("seqaij")
+    ref.setUp()
+    ref.setValuesCSR(indptr, indices, data)
+    ref.assemble()
+
+    mojo = Mojo.Mat().createSeqAIJ((5, 5), nnz=2)
+    mojo.setValuesCSR(indptr, indices, data)
+    mojo.assemble()
+
+    # the port round-trips its own CSR
+    ri, rc, rv = mojo.getValuesCSR()
+    np.testing.assert_array_equal(ri, indptr)
+    np.testing.assert_array_equal(rc, indices)
+    np.testing.assert_allclose(rv, data, rtol=TOL)
+
+    np.testing.assert_allclose(dense_of(ref, 5, 5), a, rtol=TOL)
+    np.testing.assert_allclose(
+        np.array([[mojo.getValue(i, j) for j in range(5)] for i in range(5)]),
+        a, rtol=TOL,
+    )
+
+
+def test_setvaluescsr_rejects_mismatched_arrays():
+    mojo = Mojo.Mat().createSeqAIJ((3, 3), nnz=2)
+    with pytest.raises(ValueError):
+        mojo.setValuesCSR([0, 1], [0], [1.0])          # indices/values mismatch
+    with pytest.raises(ValueError):
+        mojo.setValuesCSR([0, 1], [0], [1.0])          # indptr too short for 3 rows
+
+
 def test_is_symmetric():
     ref, mojo = dense_pair(laplacian(6))
     assert ref.isSymmetric(1e-14) is True

@@ -112,7 +112,7 @@ class PC:
         self._levels = 0
         self._shift = 0.0
         self._zeropivot = 100.0
-        self._shift_type = "positive_definite"
+        self._shift_type = "none"  # PETSc's PCFactorSetUp default
         self._ordering = MatOrderingType.NATURAL
         self._diagonal_fill = False
         # SOR options, mirroring PCSORSet*
@@ -392,18 +392,23 @@ class PC:
         rinv[r] = np.arange(n, dtype=np.int64)
         while True:
             ui = np.zeros(n + 1, dtype=np.int64)
-            uj = np.zeros(cap, dtype=np.int64)
+            ujsrc = np.zeros(cap, dtype=np.int64)
             ujlvl = np.zeros(cap, dtype=np.int64)
             udiag = np.zeros(n, dtype=np.int64)
             nnz = lib().mp_icc_symbolic(
-                addr(ui), addr(uj), addr(ujlvl), addr(udiag), addr(m.irow),
+                addr(ui), addr(ujsrc), addr(ujlvl), addr(udiag), addr(m.irow),
                 addr(m.icol), addr(r), addr(rinv), self._levels, cap,
                 addr(scratch), n,
             )
             if nnz >= 0:
                 break
             cap = -nnz + n
-        lib().mp_icc_contiguous_cholesky(addr(ui), addr(udiag), addr(uj), n)
+        # the contiguous pass moves each row into the factor layout (diagonal
+        # last) out of the staging buffer, so the two must be distinct arrays
+        uj = np.zeros(max(int(ui[-1]), 1), dtype=np.int64)
+        lib().mp_icc_contiguous_cholesky(
+            addr(ui), addr(udiag), addr(ujsrc), addr(uj), n
+        )
         ua = np.zeros(max(int(ui[-1]), 1), dtype=np.float64)
         rtmp = np.zeros(n, dtype=np.float64)
         il = np.zeros(n, dtype=np.int64)
@@ -585,38 +590,60 @@ def _csr_transpose(row, col, val, n):
 
 
 def _ilu_factor_mat(f) -> Mat:
-    """Rebuild the ILU factor as a square CSR matrix L*U, as PETSc's
-    `PCFactorGetFactorMatrix` does."""
+    """Rebuild the ILU factor as the square CSR matrix L*U, the operator whose
+    solve `pc.apply` performs.
+
+    `apply` runs the forward substitution against the L rows and the backward
+    substitution against the U rows, each diagonal already inverted, so the
+    matrix it solves against is L*U with the ordinary diagonal.  The factor
+    stores all L rows in increasing row order, then all U rows in decreasing
+    order, `bdiag[i]` pointing at the diagonal of U(i,:) and `bdiag[n]` at one
+    before its first entry.  `r` is the row ordering and `c` the column
+    ordering, both mapping a permuted index back to the original one.
+    """
     bi, bj, ba, bdiag, r, c = (
         f["bi"], f["bj"], f["ba"], f["bdiag"], f["r"], f["c"]
     )
     n = len(bi) - 1
     dense = np.zeros((n, n), dtype=np.float64)
+    # L rows: bi[i] .. bi[i+1] - 1, columns in permuted index space
     for i in range(n):
         for j in range(int(bi[i]), int(bi[i + 1])):
-            row, col = int(r[i]), int(c[int(bj[j])])
-            dense[row, col] = ba[j]
-    for i in range(n - 1, -1, -1):
+            dense[int(r[i]), int(c[int(bj[j])])] = ba[j]
+    # U rows: bdiag[i] is the diagonal (stored inverted), then the entries
+    # above it run from bdiag[i+1] + 1 up to bdiag[i] - 1
+    for i in range(n):
+        row = int(r[i])
         for j in range(int(bdiag[i + 1]) + 1, int(bdiag[i])):
-            row, col = int(r[i]), int(c[int(bj[j])])
-            dense[row, col] = ba[j]
-        piv = dense[int(r[i]), int(c[i])]
-        if piv == 0.0:
-            piv = 1.0
-        dense[int(r[i]), int(c[i])] = 1.0 / piv
+            dense[row, int(c[int(bj[j])])] = ba[j]
+        # the diagonal slot holds 1 / u_ii, so undo the inversion
+        inv = ba[int(bdiag[i])]
+        dense[row, int(c[i])] = 1.0 / inv if inv != 0.0 else 0.0
     return from_dense(dense)
 
 
 def _icc_factor_mat(f) -> Mat:
+    """Rebuild the IC factor as the square CSR matrix L*D*Lᵀ, the operator whose
+    solve `pc.apply` performs.
+
+    The factor keeps only the upper triangle U with the diagonal slot last
+    holding 1/d_k, so L = Uᵀ is recovered from it: the strictly upper slot
+    (k,i) holds -L[i,k], and the diagonal slot holds 1/d_k, so d_k is its
+    reciprocal.  `bj[j]` is the permuted column index, which `r` maps back to
+    the original one.
+    """
     bi, bj, ba, bdiag, r = f["bi"], f["bj"], f["ba"], f["bdiag"], f["r"]
     n = len(bi) - 1
-    dense = np.zeros((n, n), dtype=np.float64)
+    unit = np.zeros((n, n), dtype=np.float64)
+    d = np.zeros(n, dtype=np.float64)
     for i in range(n):
         row = int(r[i])
-        for j in range(int(bi[i]), int(bi[i + 1])):
-            col = int(r[int(bj[j])])
-            dense[col, row] = ba[j]  # L(i,j) = U(j,i)
-    for i in range(n):
-        d = int(bdiag[i])
-        dense[int(r[i]), int(r[int(bj[d])])] = 1.0 / ba[d]
-    return from_dense(dense)
+        slot = int(bdiag[i])
+        # strictly upper triangle: slot (k,i) stores -L[i,k]
+        for j in range(int(bi[i]), slot):
+            unit[int(r[int(bj[j])]), row] = -ba[j]
+        # the diagonal slot stores 1/d_i, so d_i is its reciprocal
+        inv = ba[slot]
+        d[row] = 1.0 / inv if inv != 0.0 else 0.0
+        unit[row, row] = 1.0
+    return from_dense((unit * d) @ unit.T)

@@ -22,6 +22,8 @@ the work vectors travel as one flat `Float64` arena sliced by index.
 
 from std.math import abs, exp, log, sqrt
 
+import simdvec
+
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime PI = Pointer[Int, AnyOrigin[mut=True]]
 
@@ -67,48 +69,27 @@ comptime MIN_REAL: Float64 = -1.7976931348623157e308
 
 def VecPointwiseMult_Seq(w: Ptr, x: Ptr, y: Ptr, n: Int):
     """w = x .* y.  bvec2.c VecPointwiseMult_Seq, the plain-store branch."""
-    var i = 0
-    while i < n:
-        w.unsafe_store(i, x.unsafe_load(i) * y.unsafe_load(i))
-        i += 1
+    simdvec.pointwise_mult(w, x, y, n)
 
 
 def VecPointwiseDivide_Seq(w: Ptr, x: Ptr, y: Ptr, n: Int):
     """w = x ./ y.  bvec2.c VecPointwiseApply_Seq with the ScalDiv functor."""
-    var i = 0
-    while i < n:
-        w.unsafe_store(i, x.unsafe_load(i) / y.unsafe_load(i))
-        i += 1
+    simdvec.pointwise_divide(w, x, y, n)
 
 
 def VecPointwiseMin_Seq(w: Ptr, x: Ptr, y: Ptr, n: Int):
     """w = min(x, y).  bvec2.c VecPointwiseMin_Seq via MinRealPart."""
-    var i = 0
-    while i < n:
-        var a = x.unsafe_load(i)
-        var b = y.unsafe_load(i)
-        w.unsafe_store(i, a if a < b else b)
-        i += 1
+    simdvec.pointwise_min(w, x, y, n)
 
 
 def VecPointwiseMax_Seq(w: Ptr, x: Ptr, y: Ptr, n: Int):
     """w = max(x, y).  bvec2.c VecPointwiseMax_Seq via MaxRealPart."""
-    var i = 0
-    while i < n:
-        var a = x.unsafe_load(i)
-        var b = y.unsafe_load(i)
-        w.unsafe_store(i, a if a > b else b)
-        i += 1
+    simdvec.pointwise_max(w, x, y, n)
 
 
 def VecPointwiseMaxAbs_Seq(w: Ptr, x: Ptr, y: Ptr, n: Int):
     """w = max(|x|, |y|).  bvec2.c VecPointwiseMaxAbs_Seq via MaxAbs."""
-    var i = 0
-    while i < n:
-        var a = abs(x.unsafe_load(i))
-        var b = abs(y.unsafe_load(i))
-        w.unsafe_store(i, a if a > b else b)
-        i += 1
+    simdvec.pointwise_maxabs(w, x, y, n)
 
 
 def VecNorm2(x: Ptr, n: Int) -> Float64:
@@ -116,22 +97,12 @@ def VecNorm2(x: Ptr, n: Int) -> Float64:
     the value rather than a `PetscReal *` (VecNormalize, GMRES) can share it."""
     if not n:
         return 0.0
-    var dot = 0.0
-    var i = 0
-    while i < n:
-        dot += x.unsafe_load(i) * x.unsafe_load(i)
-        i += 1
-    return sqrt(dot)
+    return sqrt(simdvec.norm2(x, n))
 
 
 def _BLASasum(x: Ptr, n: Int) -> Float64:
     """BLASasum: the sum of |x_i|."""
-    var s = 0.0
-    var i = 0
-    while i < n:
-        s += abs(x.unsafe_load(i))
-        i += 1
-    return s
+    return simdvec.asum(x, n)
 
 
 def VecNorm_Seq(x: Ptr, ntype: Int, z: Ptr, n: Int):
@@ -148,16 +119,10 @@ def VecNorm_Seq(x: Ptr, ntype: Int, z: Ptr, n: Int):
             else:
                 ztmp0 = VecNorm2(x, n)
         elif ntype == NORM_INFINITY:
-            var i = 0
-            while i < n:
-                var tmp = abs(x.unsafe_load(i))
-                # upstream adopts a strictly greater value and, on the first
-                # NaN, stores it and leaves the whole loop
-                if tmp > ztmp0 or tmp != tmp:
-                    ztmp0 = tmp
-                    if tmp != tmp:
-                        break
-                i += 1
+            # upstream adopts a strictly greater value and, on the first NaN,
+            # stores it and leaves the whole loop; simdvec.norm_infinity is
+            # that loop verbatim
+            ztmp0 = simdvec.norm_infinity(x, n)
         elif ntype == NORM_1:
             ztmp0 = _BLASasum(x, n)
     z.unsafe_store(0, ztmp0)
@@ -167,12 +132,7 @@ def VecNorm_Seq(x: Ptr, ntype: Int, z: Ptr, n: Int):
 
 def VecDot_Seq(x: Ptr, y: Ptr, val: Ptr, n: Int):
     """val = x . y.  BLASdot over the whole local array."""
-    var s = 0.0
-    var i = 0
-    while i < n:
-        s += x.unsafe_load(i) * y.unsafe_load(i)
-        i += 1
-    val.unsafe_store(0, s)
+    val.unsafe_store(0, simdvec.dot(x, y, n))
 
 
 def VecDotNorm2_Seq(x: Ptr, y: Ptr, sval: Ptr, rval: Ptr, n: Int):
@@ -182,34 +142,17 @@ def VecDotNorm2_Seq(x: Ptr, y: Ptr, sval: Ptr, rval: Ptr, n: Int):
     (`VecNorm_Norm2`); one pass over the array is observationally identical for
     a contiguous, sequential, real vector and is what the wrapper fuses.
     """
-    var s = 0.0
-    var r = 0.0
-    var i = 0
-    while i < n:
-        var xi = x.unsafe_load(i)
-        s += xi * y.unsafe_load(i)
-        r += xi * xi
-        i += 1
-    sval.unsafe_store(0, s)
-    rval.unsafe_store(0, r)
+    var r = simdvec.dot_norm2(x, y, n)
+    sval.unsafe_store(0, r[0])
+    rval.unsafe_store(0, r[1])
 
 
 def VecSum_Seq(x: Ptr, val: Ptr, n: Int):
-    var s = 0.0
-    var i = 0
-    while i < n:
-        s += x.unsafe_load(i)
-        i += 1
-    val.unsafe_store(0, s)
+    val.unsafe_store(0, simdvec.total(x, n))
 
 
 def VecMean_Seq(x: Ptr, val: Ptr, n: Int):
-    var s = 0.0
-    var i = 0
-    while i < n:
-        s += x.unsafe_load(i)
-        i += 1
-    val.unsafe_store(0, s / Float64(n))
+    val.unsafe_store(0, simdvec.total(x, n) / Float64(n))
 
 
 def VecMinMax_Seq(x: Ptr, idx: PI, z: Ptr, minmax: Float64, is_max: Int, n: Int):
@@ -253,10 +196,7 @@ def VecNormalize_Seq(x: Ptr, v: Ptr, n: Int):
     """x <- x / ||x||₂, returning the norm.  A zero vector is left alone."""
     var z = VecNorm2(x, n)
     if z > 0.0:
-        var i = 0
-        while i < n:
-            x.unsafe_store(i, x.unsafe_load(i) / z)
-            i += 1
+        simdvec.normalize_inplace(x, n, z)
     v.unsafe_store(0, z)
 
 
@@ -266,113 +206,75 @@ def VecReciprocal_Seq(x: Ptr, n: Int):
     The guard is an exact comparison, not a tolerance: PETSc reciprocates
     1e-20 to 1e20, so a `PETSC_MACHINE_EPSILON` test here would diverge.
     """
-    var i = 0
-    while i < n:
-        var xi = x.unsafe_load(i)
-        if xi != 0.0:
-            x.unsafe_store(i, 1.0 / xi)
-        else:
-            x.unsafe_store(i, 0.0)
-        i += 1
+    simdvec.reciprocal_inplace(x, n)
 
 
 def VecExp_Seq(x: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, exp(x.unsafe_load(i)))
-        i += 1
+    simdvec.exp_inplace(x, n)
 
 
 def VecLog_Seq(x: Ptr, n: Int):
     """Upstream applies no domain guard: log(0) = -inf, log(neg) = nan."""
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, log(x.unsafe_load(i)))
-        i += 1
+    simdvec.log_inplace(x, n)
 
 
 def VecSqrtAbs_Seq(x: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, sqrt(abs(x.unsafe_load(i))))
-        i += 1
+    simdvec.sqrtabs_inplace(x, n)
+
+
+def VecChop_Seq(x: Ptr, n: Int, tol: Float64):
+    """x[i] = 0 where |x[i]| < tol, otherwise x[i] is left alone.
+
+    rvector.c VecChop.  This zeroes the small entries; it does *not* replace the
+    survivors with +/-1.  The comparison is a strict `<` against `tol`, so an
+    entry whose magnitude is exactly `tol` survives -- which is why
+    `chop(0.0)` is a no-op.
+    """
+    simdvec.chop_inplace(x, n, tol)
 
 
 def VecAbs_Seq(x: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, abs(x.unsafe_load(i)))
-        i += 1
+    simdvec.abs_inplace(x, n)
 
 
 def VecConjugate_Seq(x: Ptr, n: Int):
     """PetscConj is the identity for a real build; the loop stays because
     upstream keeps it and it is where a complex build would differ."""
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, x.unsafe_load(i))
-        i += 1
+    simdvec.conjugate_inplace(x, n)
 
 
 def VecCopy_Seq(x: Ptr, y: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        y.unsafe_store(i, x.unsafe_load(i))
-        i += 1
+    simdvec.copy(y, x, n)
 
 
 def VecSwap_Seq(x: Ptr, y: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        var t = x.unsafe_load(i)
-        x.unsafe_store(i, y.unsafe_load(i))
-        y.unsafe_store(i, t)
-        i += 1
+    simdvec.swap_inplace(x, y, n)
 
 
 def VecSet_Seq(x: Ptr, alpha: Float64, n: Int):
     if alpha == 0.0:
         VecZeroEntries_Seq(x, n)
     else:
-        var i = 0
-        while i < n:
-            x.unsafe_store(i, alpha)
-            i += 1
+        simdvec.set_const(x, n, alpha)
 
 
 def VecZeroEntries_Seq(x: Ptr, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, 0.0)
-        i += 1
+    simdvec.zero(x, n)
 
 
 def VecScale_Seq(x: Ptr, alpha: Float64, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, x.unsafe_load(i) * alpha)
-        i += 1
+    simdvec.map1(x, x, n, alpha)
 
 
 def VecShift_Seq(x: Ptr, alpha: Float64, n: Int):
-    var i = 0
-    while i < n:
-        x.unsafe_store(i, x.unsafe_load(i) + alpha)
-        i += 1
+    simdvec.shift(x, x, n, alpha)
 
 
 def VecAXPY_Seq(y: Ptr, alpha: Float64, x: Ptr, n: Int):
     """y = alpha*x + y.  Handles the x aliases y case, as upstream does."""
-    if x == y:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, y.unsafe_load(i) + alpha * y.unsafe_load(i))
-            i += 1
-    else:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, y.unsafe_load(i) + alpha * x.unsafe_load(i))
-            i += 1
+    # the two branches are the same expression once x is y, so there is one
+    # sweep; the alias is still what upstream means and it reads correctly
+    simdvec.axpy(y, x, n, alpha)
 
 
 def VecAYPX_Seq(y: Ptr, alpha: Float64, x: Ptr, n: Int):
@@ -381,16 +283,10 @@ def VecAYPX_Seq(y: Ptr, alpha: Float64, x: Ptr, n: Int):
         VecCopy_Seq(x, y, n)
     elif alpha == 1.0:
         VecAXPY_Seq(y, alpha, x, n)
-    elif alpha == -1.0:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, x.unsafe_load(i) - y.unsafe_load(i))
-            i += 1
     else:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, x.unsafe_load(i) + alpha * y.unsafe_load(i))
-            i += 1
+        # covers alpha == -1.0 as alpha*y with alpha == -1.0, exactly as the
+        # subtraction branch upstream writes it
+        simdvec.aypx(y, x, n, alpha)
 
 
 def VecAXPBY_Seq(y: Ptr, alpha: Float64, beta: Float64, x: Ptr, n: Int):
@@ -400,66 +296,44 @@ def VecAXPBY_Seq(y: Ptr, alpha: Float64, beta: Float64, x: Ptr, n: Int):
     not a `VecAXPY` onto the old `y`; `alpha == 0` reduces to `VecScale`.
     """
     if beta == 0.0:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, alpha * x.unsafe_load(i))
-            i += 1
+        simdvec.map1(y, x, n, alpha)
     elif alpha == 0.0:
         VecScale_Seq(y, beta, n)
     else:
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, alpha * x.unsafe_load(i) + beta * y.unsafe_load(i))
-            i += 1
+        simdvec.axpby(y, x, n, alpha, beta)
 
 
 def VecAXPBYPCZ_Seq(
     z: Ptr, alpha: Float64, beta: Float64, gamma: Float64, x: Ptr, y: Ptr, n: Int
 ):
     """z = alpha*x + beta*y + gamma*z.  dvecimpl.h VecAXPBYPCZ_Seq."""
-    var i = 0
-    while i < n:
-        z.unsafe_store(
-            i,
-            alpha * x.unsafe_load(i)
-            + beta * y.unsafe_load(i)
-            + gamma * z.unsafe_load(i),
-        )
-        i += 1
+    simdvec.axpbypcz(z, x, y, n, alpha, beta, gamma)
 
 
 def VecWAXPY_Seq(w: Ptr, alpha: Float64, x: Ptr, y: Ptr, n: Int):
     """w = alpha*x + y.  Upstream fuses the trailing add, so w must not alias."""
-    var i = 0
-    while i < n:
-        w.unsafe_store(i, alpha * x.unsafe_load(i) + y.unsafe_load(i))
-        i += 1
+    simdvec.waxpy(w, x, y, n, alpha)
+
+
+def VecTDot_Seq(x: Ptr, y: Ptr, val: Ptr, n: Int):
+    """val = y^T x.  rvector.c VecTDot: the indefinite dot that skips the
+    conjugate, so for a real build it is BLASdot with the arguments swapped."""
+    val.unsafe_store(0, simdvec.dot(y, x, n))
 
 
 def VecMAXPY_Seq(y: Ptr, nv: Int, alpha: Ptr, x: PI, n: Int):
     """y = y + sum_k alpha[k]*x[k].  `x` is an array of vector addresses."""
     var k = 0
     while k < nv:
-        var xk = Ptr(unsafe_from_address=x.unsafe_load(k))
-        var ak = alpha.unsafe_load(k)
-        var i = 0
-        while i < n:
-            y.unsafe_store(i, y.unsafe_load(i) + ak * xk.unsafe_load(i))
-            i += 1
+        simdvec.axpy(y, Ptr(unsafe_from_address=x.unsafe_load(k)), n,
+                     alpha.unsafe_load(k))
         k += 1
 
 
 def VecMaxPointwiseDivide_Seq(x: Ptr, y: Ptr, rval: Ptr, n: Int):
     """max_i |x_i / y_i|.  Where y_i is exactly zero upstream substitutes x_i
     rather than skipping the entry; reproduced here."""
-    var m = 0.0
-    var i = 0
-    while i < n:
-        var yi = y.unsafe_load(i)
-        var v = abs(x.unsafe_load(i) if yi == 0.0 else x.unsafe_load(i) / yi)
-        m = v if v > m else m
-        i += 1
-    rval.unsafe_store(0, m)
+    rval.unsafe_store(0, simdvec.max_pointwise_divide(x, y, n))
 
 
 # ====================================================================
@@ -685,10 +559,7 @@ def PCSetUp_Jacobi_Symmetric(
 
 def PCApply_Jacobi(y: Ptr, x: Ptr, diag: Ptr, n: Int):
     """jacobi.c PCApply_Jacobi: a single VecPointwiseMult(y, x, diag)."""
-    var i = 0
-    while i < n:
-        y.unsafe_store(i, x.unsafe_load(i) * diag.unsafe_load(i))
-        i += 1
+    simdvec.pointwise_mult(y, x, diag, n)
 
 
 def MatGetRowSum_SeqAIJ(diag: Ptr, arow: PI, acol: PI, adata: Ptr, nrow: Int):

@@ -31,7 +31,10 @@ try:
 except ImportError:  # pragma: no cover
     Ref = None
 
-REPEAT = 5
+# The machine this is developed on is shared, so a single repetition can land
+# on a busy core.  Three repetitions is enough to reject that outlier while
+# still measuring the operation rather than the noise.
+REPEAT = 3
 
 
 def timeit(fn, repeat: int = REPEAT) -> float:
@@ -59,45 +62,50 @@ def machine() -> str:
 
 
 def laplacian_2d(k):
-    """The 5-point Laplacian on a k x k grid as (n, rows, cols, vals).
+    """The 5-point Laplacian on a k x k grid, as CSR (n, indptr, indices, vals).
 
-    n = k * k, and each row has at most five entries, so the pattern is built
-    without ever materialising a dense n-by-n array.
+    n = k * k and each row has at most five entries, so the pattern is built
+    directly in compressed sparse row form: never as a dense n-by-n array, and
+    never through a per-entry Python loop.  Column indices within a row are
+    ascending, which is what both packages expect.
     """
     n = k * k
-    i = np.arange(k)
-    base = (i[:, None] * k + i[None, :]).ravel()
-    rows = np.repeat(base, 5).astype(np.int32)
-    cols = np.empty(5 * n, dtype=np.int32)
-    vals = np.empty(5 * n, dtype=np.float64)
-    for j, (di, dj) in enumerate(((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))):
-        ri = i[:, None] + di
-        cj = i[None, :] + dj
-        ok = (ri >= 0) & (ri < k) & (cj >= 0) & (cj < k)
-        idx = np.where(ok, ri * k + cj, base.reshape(k, k)).ravel()
-        cols[j::5] = idx
-        vals[j::5] = np.where(ok, -1.0, 0.0).ravel()
-    vals[0::5] = 4.0
-    return n, rows, cols, vals
+    p = np.arange(n).reshape(k, k).ravel()      # row-major node numbering
+    # (n, 5) candidate columns, listed in ascending column order (up, left,
+    # self, right, down); -1 marks "off grid" and is dropped.  Ascending within
+    # a row is the CSR convention both packages expect.
+    cands = np.stack([
+        np.where(p >= k, p - k, -1),
+        np.where(p % k > 0, p - 1, -1),
+        p,
+        np.where(p % k < k - 1, p + 1, -1),
+        np.where(p < n - k, p + k, -1),
+    ], axis=1).astype(np.int64)
+    keep = cands >= 0
+    counts = keep.sum(axis=1).astype(np.int64)
+    indptr = np.zeros(n + 1, dtype=np.int32)
+    indptr[1:] = np.cumsum(counts)
+    # select the kept entries, already in ascending column order per row
+    indices = cands[keep].astype(np.int32)
+    vals = np.full(indices.shape, -1.0)
+    row_of = np.repeat(np.arange(n, dtype=np.int64), counts)
+    vals[indices == row_of] = 4.0
+    return n, indptr, indices, vals
 
 
-def ref_mat(n, rows, cols, vals):
+def ref_mat(n, indptr, indices, vals):
     m = Ref.Mat().create()
     m.setSizes([n, n])
     m.setType("seqaij")
     m.setUp()
-    for r, c, v in zip(rows.tolist(), cols.tolist(), vals.tolist()):
-        if v != 0.0:
-            m.setValue(r, c, v)
+    m.setValuesCSR(indptr, indices, vals)
     m.assemble()
     return m
 
 
-def mojo_mat(n, rows, cols, vals):
+def mojo_mat(n, indptr, indices, vals):
     m = Mojo.Mat().createSeqAIJ((n, n), nnz=5)
-    for r, c, v in zip(rows.tolist(), cols.tolist(), vals.tolist()):
-        if v != 0.0:
-            m.setValue(r, c, v)
+    m.setValuesCSR(indptr, indices, vals)
     m.assemble()
     return m
 
@@ -139,17 +147,28 @@ def vec_case(n):
 
 
 def norm_case(n):
+    """Reduction throughput.
+
+    PETSc stashes a vector's norm on the object and `VecNorm` returns the
+    stashed value when it is still valid, so a bare `norm()` loop on an
+    unchanged vector times a cache hit (measured: 0.3 us against 334 us for the
+    real reduction at n = 2^20).  `VecGetArray` invalidates the stash, so
+    touching the array first forces both sides to recompute, which is what is
+    actually being compared.
+    """
     a = np.random.default_rng(2).normal(size=n)
     v = ref_vec(a)
     w = mojo_vec(a)
 
     def ref():
+        v.getArray()
         v.norm()
 
     def mojo():
+        w.getArray()
         w.norm()
 
-    return f"Vec norm (2-norm), n = {n:,}", ref, mojo
+    return f"Vec norm (2-norm, cache defeated), n = {n:,}", ref, mojo
 
 
 def exp_case(n):
@@ -170,9 +189,9 @@ def exp_case(n):
 
 
 def matvec_case(k):
-    n, rows, cols, vals = laplacian_2d(k)
+    n, indptr, indices, vals = laplacian_2d(k)
     x = np.random.default_rng(4).normal(size=n)
-    rm, mm = ref_mat(n, rows, cols, vals), mojo_mat(n, rows, cols, vals)
+    rm, mm = ref_mat(n, indptr, indices, vals), mojo_mat(n, indptr, indices, vals)
     yr, ym = ref_vec(np.zeros(n)), mojo_vec(np.zeros(n))
     xr, xm = ref_vec(x), mojo_vec(x)
 
@@ -189,11 +208,11 @@ def matvec_case(k):
 
 
 def ksp_case(k, ksp_type, pc_type, levels=0):
-    n, rows, cols, vals = laplacian_2d(k)
+    n, indptr, indices, vals = laplacian_2d(k)
     b = np.random.default_rng(5).normal(size=n)
     x0 = np.zeros(n)
 
-    rm, mm = ref_mat(n, rows, cols, vals), mojo_mat(n, rows, cols, vals)
+    rm, mm = ref_mat(n, indptr, indices, vals), mojo_mat(n, indptr, indices, vals)
 
     pc_r = Ref.PC().create()
     pc_r.setType(pc_type)
@@ -260,6 +279,8 @@ def main() -> int:
         cases.append(ksp_case(k, "gmres", "none"))
     for k in (32, 64, 128):
         cases.append(ksp_case(k, "fgmres", "none"))
+    for k in (32, 64, 128):
+        cases.append(ksp_case(k, "bcgs", "none"))
     for k in (32, 64, 128):
         cases.append(ksp_case(k, "cg", "ilu", 0))
     for k in (32, 64, 128):

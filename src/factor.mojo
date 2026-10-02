@@ -157,6 +157,11 @@ def MatICCFactorSymbolic_SeqAIJ(
             j += 1
         nzk += IncompleteLLInit(ncols_upper, ajtmp, nrow, riip, lnk, lnklvl, bt)
 
+        # `ui[k]` is still unwritten at this point in upstream too; every read of
+        # it below is a read of the value `ui[k+1]` was given on the previous
+        # iteration, so it is hoisted here into `uk` to keep that explicit.
+        var uk = ui.unsafe_load(k)
+
         var prow = jl.unsafe_load(k)
         while prow < k:
             var nextprow = jl.unsafe_load(prow)
@@ -164,10 +169,10 @@ def MatICCFactorSymbolic_SeqAIJ(
             var jmax = ui.unsafe_load(prow + 1)
             var ncols2 = jmax - jmin
             if ncols2 > 0:
-                var off = jmin - ui.unsafe_load(prow)
-                var cols = uj.unsafe_offset(ui.unsafe_load(prow) + off)
-                var colslvl = ujlvl.unsafe_offset(ui.unsafe_load(prow) + off)
-                # PetscICCLLAddSorted offsets by the level of U(prow,prow)
+                var cols = uj.unsafe_offset(ui.unsafe_load(prow) + jmin - ui.unsafe_load(prow))
+                var colslvl = ujlvl.unsafe_offset(ui.unsafe_load(prow) + jmin - ui.unsafe_load(prow))
+                # PetscICCLLAddSorted offsets by the level of U(prow,prow),
+                # which is the entry before the 2nd nonzero of U(prow,:)
                 nzk += IncompleteLLAdd(
                     ncols2, cols, Float64(levels), colslvl, nrow, lnk, lnklvl, bt,
                     colslvl.unsafe_load(-1), 1
@@ -178,19 +183,21 @@ def MatICCFactorSymbolic_SeqAIJ(
                 jl.unsafe_store(cj, prow)
             prow = nextprow
 
-        if ui.unsafe_load(k) + nzk > cap:
-            return -(ui.unsafe_load(k) + nzk)
+        if uk + nzk > cap:
+            return -(uk + nzk)
+        # PetscLLClean writes exactly `nzk` entries: the diagonal is the first
+        # of them, because the list is sorted and the diagonal k is its minimum.
         IncompleteLLClean(
-            nrow, nrow, nzk, lnk, lnklvl, uj.unsafe_offset(ui.unsafe_load(k)),
-            ujlvl.unsafe_offset(ui.unsafe_load(k)), bt
+            nrow, nrow, nzk, lnk, lnklvl, uj.unsafe_offset(uk),
+            ujlvl.unsafe_offset(uk), bt
         )
         if nzk > 1:
-            var cj = uj.unsafe_load(ui.unsafe_load(k) + 1)
+            var cj = uj.unsafe_load(uk + 1)
             jl.unsafe_store(k, jl.unsafe_load(cj))
             jl.unsafe_store(cj, k)
-            il.unsafe_store(k, ui.unsafe_load(k) + 1)
-        udiag.unsafe_store(k, ui.unsafe_load(k) + nzk - 1)
-        ui.unsafe_store(k + 1, ui.unsafe_load(k) + nzk)
+            il.unsafe_store(k, uk + 1)
+        udiag.unsafe_store(k, uk + nzk - 1)
+        ui.unsafe_store(k + 1, uk + nzk)
         k += 1
     return ui.unsafe_load(nrow)
 
@@ -303,23 +310,29 @@ def MatILUFreeSpaceContiguousLU(
         bdiag.unsafe_store(n, bdiag.unsafe_load(n - 1) - 1)
 
 
-def MatICCFreeSpaceContiguousCholesky(ui: PI, udiag: PI, uj: PI, n: Int):
+def MatICCFreeSpaceContiguousCholesky(
+    ujsrc: PI, ui: PI, udiag: PI, uj: PI, n: Int
+):
     """freespace.c PetscFreeSpaceContiguous_Cholesky.
 
-    The linked list holds the columns of U(k,:) in ascending order, and the
-    diagonal k is the smallest of them, so the staging array has the diagonal
-    first.  The factor wants it last, with the strict upper triangle before
-    it.  The shift is toward lower addresses, so it is safe in place.
+    The symbolic phase lays row k out in the order the linked list drains, so
+    the staging array has the diagonal k first (the list is sorted and k is its
+    minimum) followed by the rest of U(k,:) in ascending order.  The factor
+    wants the diagonal last, with the strictly upper triangle before it.
+
+    Upstream copies the staging rows into a separately allocated `uj`; this
+    does the same, because shifting each row down by one in place would read
+    the source from `base + j` and the write to `base + j` has already
+    overwritten the *next* row's first entry.
     """
     var row = 0
     while row < n:
         var base = ui.unsafe_load(row)
         var nnz = ui.unsafe_load(row + 1) - base - 1
         udiag.unsafe_store(row, ui.unsafe_load(row + 1) - 1)
-        var diag = uj.unsafe_load(base)
         var j = 0
         while j < nnz:
-            uj.unsafe_store(base + j, uj.unsafe_load(base + j + 1))
+            uj.unsafe_store(base + j, ujsrc.unsafe_load(base + j + 1))
             j += 1
-        uj.unsafe_store(base + nnz, diag)
+        uj.unsafe_store(base + nnz, ujsrc.unsafe_load(base))
         row += 1
