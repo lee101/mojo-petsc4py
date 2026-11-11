@@ -5,6 +5,10 @@ and a pointer with an inferred origin is parametric.  Callers own all memory,
 including scratch, so nothing here allocates and nothing here can leak.  These
 wrappers are deliberately thin; the algorithms live in `ported.mojo` and
 `ksp.mojo` under their PETSc names.
+
+
+Part of mojo-petsc4py (MIT); the kernels it exports are transcribed from
+PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause), whose notices are in NOTICE.
 """
 
 from factor import *
@@ -288,12 +292,11 @@ def mp_pc_ilu_apply(
 
 @export("mp_pc_icc_apply")
 def mp_pc_icc_apply(
-    b: Int, x: Int, y: Int, ui: Int, uj: Int, ua: Int, udiag: Int, r: Int,
-    tirow: Int, ticol: Int, tdata: Int, nrow: Int
+    b: Int, x: Int, ui: Int, uj: Int, ua: Int, udiag: Int, c: Int,
+    scratch: Int, nrow: Int
 ) abi("C") -> Int:
     return ICCApplyFactor_SeqAIJ(
-        p(b), p(x), p(y), pi(ui), pi(uj), p(ua), pi(udiag), pi(r),
-        pi(tirow), pi(ticol), p(tdata), nrow
+        p(b), p(x), pi(ui), pi(uj), p(ua), pi(udiag), pi(c), p(scratch), nrow
     )
 
 
@@ -349,19 +352,21 @@ def mp_ilu_contiguous_lu(
 @export("mp_icc_symbolic")
 def mp_icc_symbolic(
     ui: Int, uj: Int, ujlvl: Int, udiag: Int, irow: Int, icol: Int, r: Int,
-    riip: Int, levels: Int, cap: Int, scratch: Int, nrow: Int
+    riip: Int, levels: Int, cap: Int, scratch: Int, nrow: Int, scratchlen: Int
 ) abi("C") -> Int:
     return MatICCFactorSymbolic_SeqAIJ(
         pi(ui), pi(uj), pi(ujlvl), pi(udiag), pi(irow), pi(icol), pi(r),
-        pi(riip), levels, cap, pi(scratch), nrow
+        pi(riip), levels, cap, pi(scratch), nrow, scratchlen
     )
 
 
 @export("mp_icc_contiguous_cholesky")
 def mp_icc_contiguous_cholesky(
-    ui: Int, udiag: Int, ujsrc: Int, uj: Int, n: Int
+    ujsrc: Int, ui: Int, udiag: Int, bi: Int, bdiag: Int, bj: Int, n: Int
 ) abi("C"):
-    MatICCFreeSpaceContiguousCholesky(pi(ujsrc), pi(ui), pi(udiag), pi(uj), n)
+    MatICCFreeSpaceContiguousCholesky(
+        pi(ujsrc), pi(ui), pi(udiag), pi(bi), pi(bdiag), pi(bj), n
+    )
 
 
 @export("mp_ordering_rcm")

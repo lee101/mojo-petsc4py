@@ -88,9 +88,17 @@ r.aypx(-1.0, b)
 print(ksp.getIterationNumber(), r.norm())
 ```
 
-This prints `1 1.472877282518059e-15` on the machine named in the Benchmarks
-section below. The tridiagonal system ILU(0) factorises exactly, so CG converges
-in a single iteration and what is left is round-off.
+This prints `1 1.4432899320127035e-15` on the machine named in the Benchmarks
+section below (reproduced exactly on three consecutive runs). The tridiagonal
+system ILU(0) factorises exactly, so CG converges in a single iteration and
+what is left is round-off.
+
+`_lib.py` loads `dist/libmojo-petsc4py.so` and rebuilds it with `mojo` when
+`src/` is newer, so `pixi run build` before the first import is a convenience
+rather than a requirement. `pyproject.toml` packages the Python tree only: a
+plain `pip install` of this repository would import the package but would not
+compile the library, so the supported path is the `pixi` environment above
+(with `mojo` on `PATH`, or `MOJOPETSC4PY_MOJO` pointing at it).
 
 ## Coverage
 
@@ -126,8 +134,14 @@ four norm types), `normBegin`/`normEnd`, `dot`, `tDot`, `dotNorm2`, `sum`,
 `setGMRESOrthogonalization`/`setGMRESCGSRefinementType`), `bcgs`, with the
 default convergence test (`KSPConvergedDefault`), the residual history, the
 converged-reason reporting, left/right/symmetric preconditioner sides, and
-nonzero initial guesses. All four reproduce upstream's iteration count, its
-converged reason and its iterate; see `tests/test_ksp_parity.py`.
+nonzero initial guesses. `cg`, `gmres` and `fgmres` reproduce upstream's
+iteration count, its converged reason and its iterate when they are driven the
+way `bench.py` and the tests drive them -- a `PC` set on the solver and then
+`setOperators`. `bcgs` reproduces the converged reason and the solution but can
+take a few more iterations (see divergence 16). One portability limit: a `KSP`
+used without ever calling `setPC` is not equivalent to upstream's, because
+upstream then has no preconditioner object at all; attach a `PC` (even
+`none`), as the example above does.
 
 ### Not covered
 
@@ -192,18 +206,18 @@ differs silently.
    `IC(0)`, the parity tests pass at the default level of fill, but
    `pc_factor_levels > 0` with PETSc's own ordering will not reproduce
    upstream's fill pattern.
-7. **The factor storage is rearranged in two buffers.** The symbolic phase
-   writes each row contiguously and then calls
-   `PetscFreeSpaceContiguous_LU` / `PetscFreeSpaceContiguous_Cholesky` to move
-   it into the factor layout. Those routines copy out of the staging buffer into
-   the final one in upstream; here the destination is a second caller-allocated
-   array. It has to be: the IC pass shifts each row down by one to put the
-   diagonal last, and doing that in place reads a destination the previous write
-   has already overwritten, which corrupts the next row. The pattern produced
-   is identical. The level-of-fill symbolic returns the negated capacity it
-   needs when a caller-supplied buffer is too small, so the caller can retry;
-   PETSc grows its own free-space blocks instead. Nothing about the pattern
-   depends on which path was taken.
+7. **The level-of-fill symbolic phase needs its caller to size two buffers.**
+   `MatILUFactorSymbolic_SeqAIJ` / `MatICCFactorSymbolic_SeqAIJ` return the
+   negated size they need when the staging `cap` passed in is too small, and
+   the IC variant also needs `2 * cap` entries of merge workspace after its
+   `6 * (n + 1)` fixed slots, reported the same way; the caller allocates and
+   retries. PETSc grows its own free-space blocks instead. The pattern does not
+   depend on which path was taken.
+
+   The IC contiguous pass (`PetscFreeSpaceContiguous_Cholesky`) copies into
+   `b->j` in place, which is safe because each row is shifted down by one
+   within itself; the ILU one (`PetscFreeSpaceContiguous_LU`) needs distinct
+   source and destination buffers, exactly as upstream does.
 8. **The index arrays are `Int64`, not `PetscInt`.** No value depends on it.
 9. **`VecReciprocal` guards exact zero, not a tolerance.** This was checked
    against upstream rather than assumed: PETSc reciprocates `1e-20` to `1e20`,
@@ -230,113 +244,169 @@ differs silently.
     not ported, so its preconditioner is fixed across a solve; the
     preconditioned directions are still stored and the solution assembled from
     them, which is what makes the method flexible.
-14. **`Vec.norm` is slower than upstream.** Upstream reaches the reductions
-    through BLAS with its own unrolling; the port uses a hand-written SIMD
-    sweep. On this machine the 2-norm runs at 0.55x to 0.92x of upstream's time
-    depending on length, while `exp` is 2.5x faster, which is the trade the
-    measurements in the Benchmarks section show. This is a performance
-    difference, not a behavioural one: the parity tests hold the reductions to
-    `1e-13` relative.
-15. **No parallelism and no GPU.** Everything is single-threaded Mojo. The
-    kernels here are all well under two flops per byte, which is the regime
-    where neither a thread pool nor a device transfer pays for itself; the
-    vectorised sweeps in the Benchmarks section are memory bound, not compute
-    bound.
+14. **The reductions sum in a different order from upstream's BLAS.** The
+    four-accumulator sweep groups elements into blocks of 16; upstream's
+    `BLASdot`/`BLASnrm2` unroll by their own amount. Both are plain sums, and
+    they agree to the last few bits (at most `1e-14` relative on this machine),
+    which the parity tests hold to `1e-13`. The 2-norm was the port's slowest
+    operation relative to upstream before the four-accumulator reductions and
+    the cached addresses; in the published table it is 0.71x to 1.37x, which the
+    run-to-run spread above covers.
+15. **No parallelism and no GPU.** The library is single-threaded. The
+    experiments behind this used `max.algorithm.parallelize` from a ctypes host
+    and measured a launch cost of 5 to 7.5 ms, against under 2 ms of the
+    multiply itself at every size the benchmarks reach, so a parallel variant
+    was slower and is not shipped. That API is not importable in the locked
+    environment (`max.algorithm` is absent), so the figure is a record of the
+    earlier measurement rather than something this tree can re-run. The
+    kernels are all well under two flops per byte, the regime where a device
+    transfer does not pay either; no GPU path was built.
+16. **BCGS can take a different number of iterations from upstream.** The
+    recurrence is transcribed from `KSPSolve_BCGS`, and on the tests' small SPD
+    matrices the count matches; on the 5-point Laplacian with no preconditioner
+    it can differ by a few iterations in either direction (160/162 at 64x64 and
+    301/316 at 128x128 in the table above), while the converged reason, the
+    tolerance and the solution agree. The count is decided by which of two
+    nearly equal residual estimates crosses `rtol` first, so this is the
+    reduction-order divergence (14) showing up in the solver rather than a
+    different algorithm. `tests/test_ksp_parity.py` pins that shape.
 
 ## Benchmarks
 
 Numbers are the best of three timed repetitions, produced by `pixi run bench`
-on the machine named in the table. Nothing here is estimated or extrapolated;
-where the port is slower than upstream, the table says so.
+on the machine named here. Nothing is estimated or extrapolated; where the port
+is slower than upstream, the table says so.
+
+Measured on Linux x86_64, Intel Xeon E5-2697 v4 @ 2.30 GHz, 72 logical cores,
+Python 3.13.14, NumPy 2.5.1, upstream PETSc 3.25.5, with a load average near 32.
+This is the full output of `pixi run bench` on the current tree. The machine is
+shared, so treat the ratios as indicative, not exact: re-running the 4M `Vec`
+rows over 15 repetitions gave a 1.4-3.0 ms range for `norm` on both sides
+(median 2.6 ms upstream, 2.2 ms here), which is wider than several of the
+differences in the table. `bench/direct.py` runs the same cases with nine
+repetitions and reports the median, and `bench/compare_states.py` alternates two
+builds for a before/after comparison.
 
 | case | upstream petsc4py | mojo-petsc4py | speedup |
 | --- | --- | --- | --- |
-| Vec axpy + pointwiseMult + scale, n = 65,536 | 0.253 ms | 0.277 ms | 0.91x |
-| Vec axpy + pointwiseMult + scale, n = 1,048,576 | 5.144 ms | 4.968 ms | 1.04x |
-| Vec axpy + pointwiseMult + scale, n = 4,194,304 | 56.996 ms | 42.251 ms | 1.35x |
-| Vec norm (2-norm, cache defeated), n = 65,536 | 0.024 ms | 0.042 ms | 0.57x |
-| Vec norm (2-norm, cache defeated), n = 1,048,576 | 0.290 ms | 0.529 ms | 0.55x |
-| Vec norm (2-norm, cache defeated), n = 4,194,304 | 2.630 ms | 2.866 ms | 0.92x |
-| Vec exp, n = 1,048,576 | 8.977 ms | 3.553 ms | 2.53x |
-| Mat multVec, 5-point Laplacian 64x64 (n = 4,096) | 0.022 ms | 0.039 ms | 0.57x |
-| Mat multVec, 5-point Laplacian 128x128 (n = 16,384) | 0.082 ms | 0.112 ms | 0.73x |
-| Mat multVec, 5-point Laplacian 256x256 (n = 65,536) | 0.314 ms | 0.333 ms | 0.94x |
-| CG + PCNONE, 32x32 (n = 1,024) (113/113 its ref/mojo) | 0.992 ms | 1.058 ms | 0.94x |
-| CG + PCNONE, 64x64 (n = 4,096) (225/225 its ref/mojo) | 7.572 ms | 7.855 ms | 0.96x |
-| CG + PCNONE, 128x128 (n = 16,384) (434/434 its ref/mojo) | 64.019 ms | 66.566 ms | 0.96x |
-| GMRES + PCNONE, 32x32 (n = 1,024) (232/232 its ref/mojo) | 4.271 ms | 5.560 ms | 0.77x |
-| GMRES + PCNONE, 64x64 (n = 4,096) (626/626 its ref/mojo) | 47.440 ms | 62.491 ms | 0.76x |
-| GMRES + PCNONE, 128x128 (n = 16,384) (2000/2000 its ref/mojo) | 642.834 ms | 877.161 ms | 0.73x |
-| FGMRES + PCNONE, 32x32 (n = 1,024) (232/232 its ref/mojo) | 5.071 ms | 4.962 ms | 1.02x |
-| FGMRES + PCNONE, 64x64 (n = 4,096) (626/626 its ref/mojo) | 59.611 ms | 64.424 ms | 0.93x |
-| FGMRES + PCNONE, 128x128 (n = 16,384) (2000/2000 its ref/mojo) | 667.674 ms | 745.776 ms | 0.90x |
-| BCGS + PCNONE, 32x32 (n = 1,024) (85/83 its ref/mojo) | 1.434 ms | 1.409 ms | 1.02x |
-| BCGS + PCNONE, 64x64 (n = 4,096) (160/168 its ref/mojo) | 11.084 ms | 12.510 ms | 0.89x |
-| BCGS + PCNONE, 128x128 (n = 16,384) (301/319 its ref/mojo) | 87.910 ms | 94.793 ms | 0.93x |
-| CG + PCILU, 32x32 (n = 1,024) (40/40 its ref/mojo) | 0.699 ms | 0.869 ms | 0.80x |
-| CG + PCILU, 64x64 (n = 4,096) (77/77 its ref/mojo) | 5.990 ms | 6.236 ms | 0.96x |
-| CG + PCILU, 128x128 (n = 16,384) (146/146 its ref/mojo) | 48.261 ms | 50.583 ms | 0.95x |
-| CG + PCICC, 32x32 (n = 1,024) (40/40 its ref/mojo) | 0.722 ms | 0.896 ms | 0.81x |
-| CG + PCICC, 64x64 (n = 4,096) (77/77 its ref/mojo) | 5.760 ms | 6.122 ms | 0.94x |
-| CG + PCICC, 128x128 (n = 16,384) (146/146 its ref/mojo) | 43.716 ms | 46.324 ms | 0.94x |
-| GMRES + PCJACOBI, 32x32 (n = 1,024) (232/232 its ref/mojo) | 4.356 ms | 4.724 ms | 0.92x |
-| GMRES + PCJACOBI, 64x64 (n = 4,096) (626/626 its ref/mojo) | 46.763 ms | 62.029 ms | 0.75x |
-| GMRES + PCJACOBI, 128x128 (n = 16,384) (2000/2000 its ref/mojo) | 636.641 ms | 874.541 ms | 0.73x |
-
-Machine: Linux x86_64, Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz,
-72 logical cores, Python 3.13.14, NumPy 2.5.1. Against upstream petsc4py
-3.25.5 built with the same toolchain.
-
-`pixi run bench` builds every matrix, vector, `KSP` and `PC` outside the timed
-region, so what is measured is the operation and not the setup. The `(a/b its
-ref/mojo)` column is the iteration count each side actually took on that solve.
-The port runs at 0.94x to 0.96x of upstream on unpreconditioned CG, where the
-iteration count matches exactly on both sides, and at 0.72x to 0.79x on GMRES,
-where the sequential CSR multiply and the per-vector Python round trips
-dominate. `bcgs` is the one solver whose iteration count differs: it takes 319
-iterations where upstream takes 301 at 128x128, so that row is not measuring the
-same amount of work on the two sides. `bcgs` is not bit-reproducible against
-upstream for the same reason the reductions are not — the scalars differ in the
-last bits, and a biorthogonal method amplifies that — so the parity tests hold
-it to the same solution and converged reason rather than the same iteration
-count.
+| Vec axpy + pointwiseMult + scale, n = 65,536 | 0.192 ms | 0.243 ms | 0.79x |
+| Vec axpy + pointwiseMult + scale, n = 1,048,576 | 4.576 ms | 3.547 ms | 1.29x |
+| Vec axpy + pointwiseMult + scale, n = 4,194,304 | 48.164 ms | 42.694 ms | 1.13x |
+| Vec norm (2-norm, cache defeated), n = 65,536 | 0.021 ms | 0.031 ms | 0.69x |
+| Vec norm (2-norm, cache defeated), n = 1,048,576 | 0.344 ms | 0.274 ms | 1.26x |
+| Vec norm (2-norm, cache defeated), n = 4,194,304 | 2.747 ms | 2.265 ms | 1.21x |
+| Vec exp, n = 1,048,576 | 8.419 ms | 3.226 ms | 2.61x |
+| Mat multVec, 5-point Laplacian 64x64 (n = 4,096) | 0.022 ms | 0.036 ms | 0.60x |
+| Mat multVec, 5-point Laplacian 128x128 (n = 16,384) | 0.082 ms | 0.106 ms | 0.78x |
+| Mat multVec, 5-point Laplacian 256x256 (n = 65,536) | 0.336 ms | 0.343 ms | 0.98x |
+| CG + PCNONE, 32x32 (n = 1,024) (113/113 its ref/mojo) | 0.885 ms | 0.895 ms | 0.99x |
+| CG + PCNONE, 64x64 (n = 4,096) (225/225 its ref/mojo) | 7.814 ms | 7.597 ms | 1.03x |
+| CG + PCNONE, 128x128 (n = 16,384) (434/434 its ref/mojo) | 62.096 ms | 65.590 ms | 0.95x |
+| GMRES + PCNONE, 32x32 (n = 1,024) (232/232 its ref/mojo) | 4.281 ms | 3.580 ms | 1.20x |
+| GMRES + PCNONE, 64x64 (n = 4,096) (626/626 its ref/mojo) | 48.915 ms | 57.955 ms | 0.84x |
+| GMRES + PCNONE, 128x128 (n = 16,384) (2000/2000 its ref/mojo) | 627.851 ms | 720.996 ms | 0.87x |
+| FGMRES + PCNONE, 32x32 (n = 1,024) (232/232 its ref/mojo) | 3.863 ms | 3.233 ms | 1.19x |
+| FGMRES + PCNONE, 64x64 (n = 4,096) (626/626 its ref/mojo) | 44.095 ms | 47.752 ms | 0.92x |
+| FGMRES + PCNONE, 128x128 (n = 16,384) (2000/2000 its ref/mojo) | 643.868 ms | 693.121 ms | 0.93x |
+| BCGS + PCNONE, 32x32 (n = 1,024) (85/85 its ref/mojo) | 1.475 ms | 1.249 ms | 1.18x |
+| BCGS + PCNONE, 64x64 (n = 4,096) (160/162 its ref/mojo) | 11.617 ms | 10.906 ms | 1.07x |
+| BCGS + PCNONE, 128x128 (n = 16,384) (301/316 its ref/mojo) | 88.869 ms | 91.673 ms | 0.97x |
+| CG + PCILU, 32x32 (n = 1,024) (40/40 its ref/mojo) | 0.797 ms | 0.784 ms | 1.02x |
+| CG + PCILU, 64x64 (n = 4,096) (77/77 its ref/mojo) | 6.092 ms | 6.067 ms | 1.00x |
+| CG + PCILU, 128x128 (n = 16,384) (146/146 its ref/mojo) | 47.202 ms | 48.259 ms | 0.98x |
+| CG + PCICC, 32x32 (n = 1,024) (40/40 its ref/mojo) | 0.694 ms | 0.828 ms | 0.84x |
+| CG + PCICC, 64x64 (n = 4,096) (77/77 its ref/mojo) | 5.638 ms | 6.008 ms | 0.94x |
+| CG + PCICC, 128x128 (n = 16,384) (146/146 its ref/mojo) | 43.424 ms | 48.678 ms | 0.89x |
+| GMRES + PCJACOBI, 32x32 (n = 1,024) (232/232 its ref/mojo) | 4.275 ms | 4.485 ms | 0.95x |
+| GMRES + PCJACOBI, 64x64 (n = 4,096) (626/626 its ref/mojo) | 46.950 ms | 51.261 ms | 0.92x |
 
 ### What was done, and what it bought
 
 The elementwise `Vec` layer and the reductions in it are where a Krylov method
-spends its time, and every one of those kernels was a scalar `while` loop. They
-now live in `src/simdvec.mojo`: each one has a vector body that handles
-`simd_width_of[DType.float64]()` elements per iteration and a scalar tail. The
-sweep starts at index 0 and uses `unsafe_load[width=SW]`, which lowers to an
-unaligned vector load; a `numpy` buffer is only guaranteed to be 16-byte
-aligned, so there is no alignment peel. On aligned data the unaligned form costs
-the same as the aligned one, and on unaligned data it costs what the hardware
-costs rather than a peel loop on every call.
+spends its time. Four changes were kept, each measured against the build
+before it; two were measured and dropped.
 
-Three kernels are deliberately still scalar, because a vector reduction cannot
-reproduce what they promise: `VecMinMax_Seq` reports the *first* index of a run
-of equal extremes and seeds its accumulator from `x[0]`, and the infinity norm
-adopts the first NaN and stops. `VecReciprocal` and `VecChop` need a blend
-between two computed values, which this dialect has no branchless select for.
+**The per-call cost was the first thing.** Every `Vec` method resolved each
+buffer's address with `np.ndarray.ctypes.data`, which rebuilds the array's
+ctypes descriptor on each access (about 1.8 us here) against roughly 1.3 us for
+the FFI call it feeds, and a GMRES iteration resolves a dozen of them. `Vec`,
+the `Mat` descriptor and the KSP/PC blocks now keep the address beside the
+buffer, and the reduction methods that return a plain float reuse a per-vector
+result slot instead of allocating one per call. `bench/compare_states.py` is
+the tool for measuring a before/after pair of source states; the specific
+ratios it produced at the time of that change are not reproduced here, because
+they need the earlier build, which the published table does not measure. The
+published table above is `pixi run bench` on the current tree.
 
-Two changes were measured and reverted, and the code is as it was found:
+**The reductions now carry four accumulators.** A single SIMD accumulator is
+one FMA dependency chain: it can issue one load per three cycles, about 25 GB/s
+on this core, while the array can be read at 33 GB/s. `simdvec.dot`,
+`dot_norm2`, `norm2`, `asum` and `total` accumulate a `BLK`-element block into
+four registers, so four loads are in flight. Measured in isolation on this
+machine by timing `simdvec.norm2` against a single-accumulator body of the same
+loop compiled into the same binary, the four-accumulator loop is 1.9x the
+one-accumulator loop at n = 2^16 and n = 2^20, where the array is in cache,
+and 1.4x at n = 2^22, where memory bandwidth rather than the FMA chain is the
+limit. Operator precedence is unchanged -- the same products,
+summed in a different order -- so this moves the last bits of a reduction, and
+the parity tolerance on the reductions stays what it was (`1e-13` relative,
+which they meet with room; the difference measured at most `1e-14`). The block
+is one vector group wide because a wider one is not correct here: a body that
+stashed four accumulators over four block offsets built to a single `vaddpd`
+and answered a quarter of the truth in a standalone binary, whatever form the
+accumulators were declared in, so the width kept is the one that was checked in
+the disassembly and against a numpy reference at every length from 0 to 16385.
 
-- Fusing the `VecCopy` of `b` into the `aypx` of the initial residual changed
-  GMRES from 232 iterations to a breakdown at 30. The two-pass form is correct.
-- Unrolling the CSR multiply four ways to give the loop four independent
-  dependency chains is not expressible: `y` is indexed by row, so a 4-way
-  unroll over non-zero entries indexes `y` out of bounds on a 2-entry row.
+**Four guarded kernels stayed scalar on purpose.** `VecMinMax_Seq` reports the
+*first* index of a run of equal extremes, and the infinity norm adopts the first
+NaN and stops; neither survives a reordering. `VecReciprocal` and `VecChop`
+need a per-lane select, which this dialect does not have (no `select`, no
+`reduce_or` on a boolean SIMD, no lane indexing of one). A group-wide "all
+lanes are ordinary" test was written, measured and reverted: it is wrong for a
+subnormal, which must reciprocate to infinity, and wrong for an entry exactly
+at `chop`'s tolerance, which must be rewritten rather than left alone.
 
-`max.algorithm.parallelize` was compiled and measured rather than assumed. It
-works on this toolchain, but this library is driven from a ctypes host, so every
-launch pays a thread-pool dispatch that the elementwise kernels cannot amortise
-at the sizes the benchmarks exercise. It is not in the shipped path.
+**The GMRES inner products are batched.** Classical Gram-Schmidt's `VecMDot`
+computed one dot per basis vector and re-read the new Krylov vector from memory
+each time. It now folds four rows at a time through `_mdot_basis`: one load of
+each `x` group serves four rows. A row keeps its own block-then-tail sequence,
+so its value is the one the single-vector `dot` produced. The gain is small and
+does not reproduce at every size: against the unbatched build it came out 0.90x
+on n = 16384 (2^14 rows per dot, 2000 iterations) and 1.42x on n = 4096 on one
+pair of runs, and 1.009x and 1.036x on another. Above 2^14 the vector is out of
+cache and reading it once per four rows is a real saving; at 2^12 it fits in
+cache and the extra live accumulators cost about what the saved loads were
+worth. The honest statement is that it is neutral to 40% faster depending on
+size, not uniformly faster.
 
-No GPU path was attempted. Every kernel here reads 8 bytes and writes 8 bytes
-per element and does one or two arithmetic operations on them, which is well
-under the arithmetical intensity where a `max.gpu.host` launch can stop losing
-to plain SIMD on CPU; on a memory-bound sweep the transfer would dominate any
-arithmetic anyway.
+**IC's triangular solve drops two passes.** It copied `b` into `x`, ran the
+forward sweep in place, and then made two more length-n copies to apply the
+column permutation. Upstream's `MatSolve_SeqSBAIJ_1_inplace` gathers `b` into
+the work vector as it permutes it and writes `x` directly from the back
+substitution, because a row reads only columns that the rows below it have
+already written. The port now does the same, three passes instead of five.
+
+Measured and dropped:
+
+- **`max.algorithm.parallelize` for the CSR multiply.** In the earlier
+  measurement it compiled and ran from a ctypes host on this toolchain, at a
+  launch cost of 5.0 to 7.5 ms here, flat, against 0.1 to 1.9 ms of matvec work
+  at n = 16384 to 262144, so every parallel variant was 5x to 20x *slower* than
+  the serial loop. (The API is not importable in the locked environment, so
+  this is not re-runnable here.) It only pays
+  once a kernel runs for tens of milliseconds, which no covered operation does
+  at the sizes callers pass. The same launch cost makes it lose on `Vec` too.
+- **Fusing the `VecCopy` of `b` into the `aypx` of the initial residual**, from
+  the earlier work: it changed GMRES from 232 iterations to a breakdown at 30.
+  The two-pass form is correct.
+
+A GPU path was not built. Every covered kernel moves 16 bytes per element and
+does one or two operations on them, far below the intensity at which a
+`max.gpu.host` launch can beat SIMD on a CPU, and on a memory-bound sweep the
+transfer would dominate the arithmetic. (`max.algorithm` and `max.gpu` are not
+importable in the locked environment; this is an argument from the kernels'
+arithmetic intensity, not a measurement of a device path, since no device path
+was built.)
 
 ## How it works
 
@@ -382,9 +452,26 @@ ORTHOG    max_k + 2
 
 and `HH(a, b) = hh + b * (max_k + 2) + a`, exactly as upstream's macro.
 
+**Factor layouts.** The two incomplete factorisations use PETSc's own layouts,
+and a reader checking the port against `aijfact.c` needs them stated, because
+they are not the obvious ones:
+
+- ILU. `bj` holds every L row in increasing order, then every U row in
+  decreasing order, each U row ending on its diagonal, which is stored
+  inverted. `bi` delimits the L block and `bdiag[i]` is that row's diagonal,
+  counted back from the end of the array. This is the layout
+  `MatILUFactorSymbolic_SeqAIJ`'s header comment documents, and
+  `MatLUFactorNumeric_SeqAIJ` / `MatSolve_SeqAIJ` are transcribed against it.
+- IC. The factor is `MATSEQSBAIJ`, storing the strictly upper triangle of `A`
+  with each row's diagonal slot last, holding `1/d_i`. `udiag[i] ==
+  b->i[i + 1] - 1`. This is what `MatGetRowIJ` reports on a real petsc4py IC
+  factor (checked directly: for a tridiagonal matrix it prints
+  `ja = [1, 0, 2, 1, 3, 2, ...]`), and `MatCholeskyFactorNumeric_SeqAIJ` /
+  `MatSolve_SeqSBAIJ_1_NaturalOrdering` are transcribed against it.
+
 ## Tests
 
-`pixi run test` runs seven suites plus the conftest path setup:
+`pixi run test` runs eleven suites (594 tests) plus the conftest path setup:
 
 - `tests/test_vec_parity.py` — every covered `Vec` method against real
   petsc4py, entry for entry, including the cases that distinguish the
@@ -414,11 +501,32 @@ and `HH(a, b) = hh + b * (max_k + 2) + a`, exactly as upstream's macro.
   have to stay distinct.
 - `tests/test_factor_layout.py` — the ILU and IC factor layouts directly. These
   kernels index flat caller-owned arrays with no bounds checks, so a layout
-  mistake is a silent out-of-bounds write rather than an exception; the tests
-  pin `ui`/`uj`/`udiag` down and assert the contiguous pass does not touch its
-  staging buffer.
+  mistake is a silent out-of-bounds write rather than an exception. The tests
+  pin down the IC factor's row shape (strictly upper columns ascending, then
+  the diagonal slot), the `b->i`/`b->diag` relationship the numeric pass and
+  the triangular solve both read, and that the contiguous pass leaves the
+  staging map `ui` alone.
 - `tests/test_simd_parity.py` — the vectorised elementwise kernels and
   reductions against real petsc4py at sizes that straddle the vector width.
+- `tests/test_block_reductions.py` — the reductions at the lengths that enter
+  their four-accumulator block (0, one, `SW`-1, `SW`, `SW`+1 and every boundary
+  up to 16385) against both NumPy over the whole array and upstream, so a block
+  that is skipped or double-counted fails on the value; the guarded reciprocal
+  at a zero, a subnormal and a NaN; `chop` at exactly its tolerance; and a
+  GMRES/FGMRES solve through the batched inner products, checked on the iterate
+  and the iteration count.
+- `tests/test_addr_cache.py` — the cached FFI addresses. Every public path that
+  rebinds a vector's storage is walked and the reported address must be the new
+  buffer's, because a stale one is a dangling pointer rather than an exception.
+- `tests/test_exported_kernels.py` — every `@export`ed kernel called by name,
+  with the argument blocks built from the documented layouts and its output
+  checked against an independent NumPy reference or against real petsc4py.
+  The parity suites reach these kernels through the public API, which cannot
+  notice a kernel that is wired up but wrong; this file closes that hole, and
+  the check is mechanical: each `@export("name")` in `src/capi.mojo` must
+  appear as a literal in the file. It also asserts that the library that was
+  loaded really is `dist/libmojo-petsc4py.so`, so no test can pass on a
+  pure-Python fallback.
 - `tests/test_ffi_signatures.py` — every `@export` in `src/capi.mojo` against
   the ctypes declaration in `_lib.py`. Both sides take buffers as `Int`
   addresses, so a declaration that is one argument short does not raise; it
@@ -428,6 +536,85 @@ and `HH(a, b) = hh + b * (max_k + 2) + a`, exactly as upstream's macro.
 The suite requires upstream petsc4py, which `pixi.toml` installs; each file
 skips itself cleanly with `importorskip` if the package is absent.
 
-## License
+## License and provenance
 
-MIT, as upstream. See `LICENSE`.
+The original code in this repository -- the Python packages, the Mojo modules,
+the build and benchmark scripts and the tests -- is MIT; see `LICENSE`. It is a
+transcription, not a fork: the algorithm in each ported function is derived from
+PETSc / petsc4py source, and that derivation is recorded here and in `NOTICE`.
+The upstream material is 2-clause BSD, which is compatible with keeping the
+original port under MIT; the upstream copyright notices and licence conditions
+are retained in `NOTICE` and in the two blocks below, because the BSD licence
+requires them to accompany redistributions.
+
+| upstream | URL and revision | license | derived into |
+| --- | --- | --- | --- |
+| petsc4py `PETSc/{Vec,Mat,PC,KSP}.pyx` and the `PETSc` Python API it defines | <https://gitlab.com/petsc/petsc/-/tree/v3.25.5/src/binding/petsc4py> tag `v3.25.5` | BSD-2-Clause (`LICENSE.rst` in that directory) | `python/mojopetsc4py/PETSc/`, `src/ported.mojo`, `src/ksp.mojo` |
+| PETSc `src/mat/impls/aij/seq/{aij.c,aijfact.c}`, `src/mat/impls/sbaij/seq/sbaijfact2.c`, `src/mat/utils/freespace.c`, `include/petsc/private/matimpl.h` | <https://gitlab.com/petsc/petsc> tag `v3.25.5` | BSD-2-Clause (`LICENSE` at the repository root) | `src/ported.mojo`, `src/factor.mojo` |
+| PETSc `src/ksp/ksp/impls/{cg,gmres,fgmres,bcgs}`, `src/ksp/ksp/interface/itres.c`, `src/ksp/pc/impls/{jacobi,sor}` | <https://gitlab.com/petsc/petsc> tag `v3.25.5` | BSD-2-Clause | `src/ksp.mojo`, `src/ported.mojo` |
+
+The parity tests and benchmarks run against the upstream packages but do not
+copy them: `petsc4py` and `petsc` are pip/conda dependencies, not vendored, and
+nothing from their source tree is included in this one.
+
+**PETSc** (from `LICENSE` at tag `v3.25.5`; also in `NOTICE`):
+
+```
+Copyright (c) 1991-2025, UChicago Argonne, LLC and the PETSc Developers and Contributors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+**petsc4py** (from `src/binding/petsc4py/LICENSE.rst` at tag `v3.25.5`; also in `NOTICE`):
+
+```
+Copyright (c) 2025, Lisandro Dalcin.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+* Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+No upstream dataset is bundled: every test and benchmark matrix is generated
+at run time from its definition (a 1-D or 5-point 2-D Laplacian, a random
+symmetric positive-definite matrix from a fixed seed), so there is no data
+whose redistribution terms would need checking.

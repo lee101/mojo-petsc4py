@@ -289,3 +289,63 @@ def test_operations_reject_mismatched_operand_sizes():
         mojo.getDiagonal(short)
     with pytest.raises(ValueError):
         mojo.mult(full, short)
+
+
+def test_copy_before_assemble_copies_the_pending_entries():
+    """`Mat.copy` flushes the pending dict, so an unassembled source copies the
+    same entries as an assembled one instead of the zeros still in `data`."""
+    src = Mojo.Mat().createSeqAIJ(3, nnz=1)
+    dst = Mojo.Mat().createSeqAIJ(3, nnz=4)
+    for i in range(3):
+        src.setValue(i, i, float(i + 1))
+    src.copy(dst)
+    assert [dst.getValue(i, i) for i in range(3)] == [1.0, 2.0, 3.0]
+    src.assemble()
+    assert [dst.getValue(i, i) for i in range(3)] == [1.0, 2.0, 3.0]
+
+
+def test_copy_different_nonzero_pattern_matches_upstream():
+    """`Mat.Structure.DIFFERENT_NONZERO_PATTERN` keeps the target's own pattern
+    and copies the values of the entries it holds, as `MatCopy` does.  A target
+    holding pattern P of one matrix receives the values of the same P from a
+    second matrix that has a different value on every entry."""
+    a = laplacian(6)
+    b = a + np.eye(6) * 5.0  # same pattern, different values
+
+    def build(cls, dense):
+        if cls is Ref:
+            m = Ref.Mat().createAIJ((6, 6)); m.setUp()
+            for i in range(6):
+                for j in range(6):
+                    if dense[i, j]:
+                        m.setValue(i, j, float(dense[i, j]))
+            m.assemble()
+            return m
+        return Mojo.from_dense(dense)
+
+    ref_src, mojo_src = build(Ref, b), build(Mojo, b)
+    ref_dst, mojo_dst = build(Ref, a), build(Mojo, a)
+    ref_src.copy(ref_dst, structure=Ref.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+    mojo_src.copy(
+        mojo_dst, structure=Mojo.Mat.Structure.DIFFERENT_NONZERO_PATTERN
+    )
+    np.testing.assert_allclose(mojo_dst._dense(), dense_of(ref_dst, 6, 6))
+    np.testing.assert_allclose(mojo_dst._dense(), b)
+
+
+def test_transpose_add_rejects_an_output_aliasing_the_input():
+    """The transpose kernel clears `y` first, so upstream refuses `y is x`; a
+    port that accepted it would silently compute a different answer."""
+    a = laplacian(5)
+    m = Mojo.from_dense(a)
+    x = Mojo.Vec().createWithArray(np.arange(5, dtype=float))
+    v = Mojo.Vec().createWithArray(np.ones(5))
+    with pytest.raises(ValueError):
+        m.multTransposeAdd(x, v, x)
+    with pytest.raises(ValueError):
+        m.multAdd(x, v, x)
+    # y may be v, and then the result is A^T x + v with v read before the write
+    out = m.multTransposeAdd(x, v, v)
+    np.testing.assert_allclose(
+        out.getArray(), a.T @ np.arange(5, dtype=float) + 1.0, rtol=TOL
+    )

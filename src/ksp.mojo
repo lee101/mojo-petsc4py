@@ -40,9 +40,16 @@ The GMRES-family scalar block `hs` is one allocation with fixed offsets:
 
 `vv` is the Arnoldi basis, (max_k + 1) vectors of length n laid out contiguously;
 `prevec` is FGMRES's copy of the preconditioned directions, same shape.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from ported import *
+from simd import BLK, SW
+from std.memory import alloc
 
 comptime KSP_CG: Int = 2
 comptime KSP_BCGS: Int = 6
@@ -161,16 +168,16 @@ def KSP_PCApply(pci: PI, pcf: Ptr, pstmp: Ptr, n: Int, x: Ptr, y: Ptr):
             PI(unsafe_from_address=pci.unsafe_load(6)), n
         )
     elif kind == PC_ICC:
+        # aux0..4 the factor, aux5 the column ordering; the solve needs a
+        # length-n work vector for the scatter, which is `pstmp`
         _ = ICCApplyFactor_SeqAIJ(
-            x, y, pstmp,
+            x, y,
             PI(unsafe_from_address=pci.unsafe_load(1)),
             PI(unsafe_from_address=pci.unsafe_load(2)),
             Ptr(unsafe_from_address=pci.unsafe_load(3)),
             PI(unsafe_from_address=pci.unsafe_load(4)),
             PI(unsafe_from_address=pci.unsafe_load(5)),
-            PI(unsafe_from_address=pci.unsafe_load(6)),
-            PI(unsafe_from_address=pci.unsafe_load(7)),
-            Ptr(unsafe_from_address=pci.unsafe_load(8)), n
+            pstmp, n
         )
     elif kind == PC_SOR:
         # aux0..3 the matrix, aux4/aux5 the cached inverse and raw diagonal,
@@ -946,6 +953,115 @@ def _snorm2(x: Ptr, n: Int) -> Float64:
     return simdvec.norm2(x, n)
 
 
+def _mdot_basis(x: Ptr, y: Ptr, nv: Int, n: Int, res: Ptr):
+    """VecMDot(x, nv, &V(0), out): x against each of `nv` vectors of a block.
+
+    Four rows at a time, with `x` read once per group of four instead of once
+    per row: the block loop reuses the four `x` registers it has just loaded
+    for all four rows.  Row `j` sees the same operands in the same order as the
+    single-block `simdvec.dot` it replaces -- block loads, then scalar
+    elements, then a reduction -- so it produces that dot's value.
+    """
+    var zero = SIMD[DType.float64, SW](0.0)
+    var a00 = zero
+    var a01 = zero
+    var a02 = zero
+    var a03 = zero
+    var a10 = zero
+    var a11 = zero
+    var a12 = zero
+    var a13 = zero
+    var a20 = zero
+    var a21 = zero
+    var a22 = zero
+    var a23 = zero
+    var a30 = zero
+    var a31 = zero
+    var a32 = zero
+    var a33 = zero
+    var i = 0
+    var j = 0
+    while j + 4 <= nv:
+        var u0 = y.unsafe_offset(j * n)
+        var u1 = y.unsafe_offset((j + 1) * n)
+        var u2 = y.unsafe_offset((j + 2) * n)
+        var u3 = y.unsafe_offset((j + 3) * n)
+        i = 0
+        while i + BLK <= n:
+            var v0 = x.unsafe_load[width=SW](i)
+            var v1 = x.unsafe_load[width=SW](i + SW)
+            var v2 = x.unsafe_load[width=SW](i + 2 * SW)
+            var v3 = x.unsafe_load[width=SW](i + 3 * SW)
+            a00 += v0 * u0.unsafe_load[width=SW](i)
+            a01 += v1 * u0.unsafe_load[width=SW](i + SW)
+            a02 += v2 * u0.unsafe_load[width=SW](i + 2 * SW)
+            a03 += v3 * u0.unsafe_load[width=SW](i + 3 * SW)
+            a10 += v0 * u1.unsafe_load[width=SW](i)
+            a11 += v1 * u1.unsafe_load[width=SW](i + SW)
+            a12 += v2 * u1.unsafe_load[width=SW](i + 2 * SW)
+            a13 += v3 * u1.unsafe_load[width=SW](i + 3 * SW)
+            a20 += v0 * u2.unsafe_load[width=SW](i)
+            a21 += v1 * u2.unsafe_load[width=SW](i + SW)
+            a22 += v2 * u2.unsafe_load[width=SW](i + 2 * SW)
+            a23 += v3 * u2.unsafe_load[width=SW](i + 3 * SW)
+            a30 += v0 * u3.unsafe_load[width=SW](i)
+            a31 += v1 * u3.unsafe_load[width=SW](i + SW)
+            a32 += v2 * u3.unsafe_load[width=SW](i + 2 * SW)
+            a33 += v3 * u3.unsafe_load[width=SW](i + 3 * SW)
+            i += BLK
+        var t0 = 0.0
+        var t1 = 0.0
+        var t2 = 0.0
+        var t3 = 0.0
+        while i < n:
+            var xv = x.unsafe_load(i)
+            t0 += xv * u0.unsafe_load(i)
+            t1 += xv * u1.unsafe_load(i)
+            t2 += xv * u2.unsafe_load(i)
+            t3 += xv * u3.unsafe_load(i)
+            i += 1
+        res.unsafe_store(j, (a00 + a01 + a02 + a03).reduce_add() + t0)
+        res.unsafe_store(j + 1, (a10 + a11 + a12 + a13).reduce_add() + t1)
+        res.unsafe_store(j + 2, (a20 + a21 + a22 + a23).reduce_add() + t2)
+        res.unsafe_store(j + 3, (a30 + a31 + a32 + a33).reduce_add() + t3)
+        a00 = zero
+        a01 = zero
+        a02 = zero
+        a03 = zero
+        a10 = zero
+        a11 = zero
+        a12 = zero
+        a13 = zero
+        a20 = zero
+        a21 = zero
+        a22 = zero
+        a23 = zero
+        a30 = zero
+        a31 = zero
+        a32 = zero
+        a33 = zero
+        j += 4
+    while j < nv:
+        var u = y.unsafe_offset(j * n)
+        var b0 = zero
+        var b1 = zero
+        var b2 = zero
+        var b3 = zero
+        i = 0
+        while i + BLK <= n:
+            b0 += x.unsafe_load[width=SW](i) * u.unsafe_load[width=SW](i)
+            b1 += x.unsafe_load[width=SW](i + SW) * u.unsafe_load[width=SW](i + SW)
+            b2 += x.unsafe_load[width=SW](i + 2 * SW) * u.unsafe_load[width=SW](i + 2 * SW)
+            b3 += x.unsafe_load[width=SW](i + 3 * SW) * u.unsafe_load[width=SW](i + 3 * SW)
+            i += BLK
+        var tb = 0.0
+        while i < n:
+            tb += x.unsafe_load(i) * u.unsafe_load(i)
+            i += 1
+        res.unsafe_store(j, (b0 + b1 + b2 + b3).reduce_add() + tb)
+        j += 1
+
+
 def _mdot_vv(base: Int, k: Int, other: Int, res: Ptr, n: Int):
     """VecMDot(VV(k), k + 1, &VV(0), out) over a flat basis block.
 
@@ -953,10 +1069,7 @@ def _mdot_vv(base: Int, k: Int, other: Int, res: Ptr, n: Int):
     so the loop covers all of them.  The caller passes `k = it + 1`, which is
     why the last index is `k - 1`.
     """
-    var j = 0
-    while j < k:
-        res.unsafe_store(j, _dot(_vv(base, k, n), _vv(other, j, n), n))
-        j += 1
+    _mdot_basis(_vv(base, k, n), _vv(other, 0, n), k, n, res)
 
 
 def _maxpy_vv(y: Ptr, alpha: Ptr, base: Int, nvec: Int, n: Int):

@@ -17,11 +17,19 @@ Elementwise `exp` and `log` are one libm call per element.  `std.math.exp`
 vectorises on this target, so those two sweep four elements per call; if a
 target ever reported that as a compile-time constant fallback, the loops would
 degrade to four scalar calls rather than to a wrong answer.
+
+`reciprocal_inplace` and `chop_inplace` stay scalar: both need a per-lane
+select, which this dialect does not have, and a group-wide test cannot be exact
+for a subnormal (which reciprocates to infinity) or for an entry at `tol`.
+
+
+Part of mojo-petsc4py (MIT); the kernels it exports are transcribed from
+PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause), whose notices are in NOTICE.
 """
 
 from std.math import abs, exp, log, sqrt
 
-from simd import SW
+from simd import BLK, SW
 
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 
@@ -239,9 +247,10 @@ def reciprocal_inplace(x: Ptr, n: Int):
     """x <- 1/x with upstream's exact-zero guard: 0 maps to 0, not inf.
 
     The guard is an exact comparison, not a tolerance: PETSc reciprocates
-    1e-20 to 1e20, so an epsilon test would diverge.  Selecting between the two
-    branches needs a blend, and this dialect has no branchless select the
-    compiler turns into one, so the sweep stays scalar.
+    1e-20 to 1e20, so an epsilon test would diverge.  Only a zero is guarded,
+    so a subnormal still reciprocates to infinity; the value cannot be selected
+    per lane (no select in this dialect) and a group-wide test cannot be exact
+    for every such entry, so the sweep stays scalar and per-entry exact.
     """
     var i = 0
     while i < n:
@@ -253,7 +262,9 @@ def reciprocal_inplace(x: Ptr, n: Int):
 def chop_inplace(x: Ptr, n: Int, tol: Float64):
     """Zero the entries whose magnitude is strictly below `tol`.
 
-    Same reason as `reciprocal_inplace`: the body is a compare plus a blend.
+    Same reason as `reciprocal_inplace`: the body is a compare and a
+    conditional store, and this dialect has no per-lane select to vectorise it
+    with; an entry at or above `tol` must be left untouched, not rewritten.
     """
     var i = 0
     while i < n:
@@ -309,11 +320,29 @@ def swap_inplace(x: Ptr, y: Ptr, n: Int):
 
 
 # ------------------------------------------------------------ reductions
+#
+# A reduction reads its operands once and folds them into four SIMD
+# accumulators, one `BLK`-element block at a time.  Each accumulator is a
+# separate FMA dependency chain, so the loads that follow the one just issued
+# issue immediately instead of waiting out the FMA latency.  Operator precedence
+# is unchanged -- the same terms are multiplied and subtracted, only the order
+# of summation differs -- so a caller still gets a plain sum over the array.
 
 
 def dot(x: Ptr, y: Ptr, n: Int) -> Float64:
-    var acc = SIMD[DType.float64, SW](0.0)
+    var zero = SIMD[DType.float64, SW](0.0)
+    var a0 = zero
+    var a1 = zero
+    var a2 = zero
+    var a3 = zero
     var i = 0
+    while i + BLK <= n:
+        a0 += x.unsafe_load[width=SW](i) * y.unsafe_load[width=SW](i)
+        a1 += x.unsafe_load[width=SW](i + SW) * y.unsafe_load[width=SW](i + SW)
+        a2 += x.unsafe_load[width=SW](i + 2 * SW) * y.unsafe_load[width=SW](i + 2 * SW)
+        a3 += x.unsafe_load[width=SW](i + 3 * SW) * y.unsafe_load[width=SW](i + 3 * SW)
+        i += BLK
+    var acc = a0 + a1 + a2 + a3
     while i + SW <= n:
         acc += x.unsafe_load[width=SW](i) * y.unsafe_load[width=SW](i)
         i += SW
@@ -326,9 +355,32 @@ def dot(x: Ptr, y: Ptr, n: Int) -> Float64:
 
 def dot_norm2(x: Ptr, y: Ptr, n: Int) -> Tuple[Float64, Float64]:
     """(x.y, x.x) in a single pass, so x is read once instead of twice."""
-    var dacc = SIMD[DType.float64, SW](0.0)
-    var nacc = SIMD[DType.float64, SW](0.0)
+    var zero = SIMD[DType.float64, SW](0.0)
+    var d0 = zero
+    var d1 = zero
+    var d2 = zero
+    var d3 = zero
+    var q0 = zero
+    var q1 = zero
+    var q2 = zero
+    var q3 = zero
     var i = 0
+    while i + BLK <= n:
+        var v0 = x.unsafe_load[width=SW](i)
+        var v1 = x.unsafe_load[width=SW](i + SW)
+        var v2 = x.unsafe_load[width=SW](i + 2 * SW)
+        var v3 = x.unsafe_load[width=SW](i + 3 * SW)
+        d0 += v0 * y.unsafe_load[width=SW](i)
+        d1 += v1 * y.unsafe_load[width=SW](i + SW)
+        d2 += v2 * y.unsafe_load[width=SW](i + 2 * SW)
+        d3 += v3 * y.unsafe_load[width=SW](i + 3 * SW)
+        q0 += v0 * v0
+        q1 += v1 * v1
+        q2 += v2 * v2
+        q3 += v3 * v3
+        i += BLK
+    var dacc = d0 + d1 + d2 + d3
+    var nacc = q0 + q1 + q2 + q3
     while i + SW <= n:
         var vx = x.unsafe_load[width=SW](i)
         dacc += vx * y.unsafe_load[width=SW](i)
@@ -345,8 +397,19 @@ def dot_norm2(x: Ptr, y: Ptr, n: Int) -> Tuple[Float64, Float64]:
 
 
 def asum(x: Ptr, n: Int) -> Float64:
-    var acc = SIMD[DType.float64, SW](0.0)
+    var zero = SIMD[DType.float64, SW](0.0)
+    var a0 = zero
+    var a1 = zero
+    var a2 = zero
+    var a3 = zero
     var i = 0
+    while i + BLK <= n:
+        a0 += abs(x.unsafe_load[width=SW](i))
+        a1 += abs(x.unsafe_load[width=SW](i + SW))
+        a2 += abs(x.unsafe_load[width=SW](i + 2 * SW))
+        a3 += abs(x.unsafe_load[width=SW](i + 3 * SW))
+        i += BLK
+    var acc = a0 + a1 + a2 + a3
     while i + SW <= n:
         acc += abs(x.unsafe_load[width=SW](i))
         i += SW
@@ -358,8 +421,23 @@ def asum(x: Ptr, n: Int) -> Float64:
 
 
 def norm2(x: Ptr, n: Int) -> Float64:
-    var acc = SIMD[DType.float64, SW](0.0)
+    var zero = SIMD[DType.float64, SW](0.0)
+    var a0 = zero
+    var a1 = zero
+    var a2 = zero
+    var a3 = zero
     var i = 0
+    while i + BLK <= n:
+        var v0 = x.unsafe_load[width=SW](i)
+        var v1 = x.unsafe_load[width=SW](i + SW)
+        var v2 = x.unsafe_load[width=SW](i + 2 * SW)
+        var v3 = x.unsafe_load[width=SW](i + 3 * SW)
+        a0 += v0 * v0
+        a1 += v1 * v1
+        a2 += v2 * v2
+        a3 += v3 * v3
+        i += BLK
+    var acc = a0 + a1 + a2 + a3
     while i + SW <= n:
         var vx = x.unsafe_load[width=SW](i)
         acc += vx * vx
@@ -372,8 +450,19 @@ def norm2(x: Ptr, n: Int) -> Float64:
 
 
 def total(x: Ptr, n: Int) -> Float64:
-    var acc = SIMD[DType.float64, SW](0.0)
+    var zero = SIMD[DType.float64, SW](0.0)
+    var a0 = zero
+    var a1 = zero
+    var a2 = zero
+    var a3 = zero
     var i = 0
+    while i + BLK <= n:
+        a0 += x.unsafe_load[width=SW](i)
+        a1 += x.unsafe_load[width=SW](i + SW)
+        a2 += x.unsafe_load[width=SW](i + 2 * SW)
+        a3 += x.unsafe_load[width=SW](i + 3 * SW)
+        i += BLK
+    var acc = a0 + a1 + a2 + a3
     while i + SW <= n:
         acc += x.unsafe_load[width=SW](i)
         i += SW

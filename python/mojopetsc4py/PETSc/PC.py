@@ -3,13 +3,18 @@
 Covered types: `none`, `jacobi`, `sor`, `ilu`, `icc`.  Everything else in the
 upstream `PCType` enum exists as a name but raises `NotImplementedError` when
 selected; see the README's coverage section.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .._lib import addr, lib
+from .._lib import AddrBuf, addr, lib
 from .Mat import Mat, MatOrderingType, from_dense
 from .Vec import Vec
 
@@ -136,6 +141,9 @@ class PC:
         self._mdiag = None
         self._sorwork = None
         self._pci = None
+        self._pci_cache = None
+        self._pcf_buf = None
+        self._pstmp_buf = None
         self._pcf = None
         self._pstmp = None
 
@@ -146,6 +154,7 @@ class PC:
     def destroy(self) -> "PC":
         self._factor = None
         self._setupcalled = False
+        self._pci_cache = None
         return self
 
     def setType(self, pc_type) -> None:
@@ -187,6 +196,7 @@ class PC:
 
     def reset(self) -> None:
         self._setupcalled = False
+        self._pci_cache = None
         self._reset_factor()
 
     def _reset_factor(self):
@@ -194,6 +204,7 @@ class PC:
         self._factor = None
         self._diag = None
         self._diagsqrt = None
+        self._pci_cache = None
 
     # ---------------------------------------------------------- options
     def setFactorLevels(self, levels) -> None:
@@ -201,15 +212,48 @@ class PC:
         self._setupcalled = False
 
     def setFactorShift(self, shift_type, amount=None) -> None:
-        self._shift_type = str(shift_type)
+        """Select the pivot-shift strategy.
+
+        Only `none` (PETSc's default, no retry) is ported.  `positive_definite`
+        and `nonzero` make upstream retry the numeric factorisation with a
+        growing diagonal shift until no pivot is too small (`MatPivotCheck`);
+        the port does not, so accepting the name would silently return a
+        different factor.  An unknown name is rejected the way PETSc rejects it,
+        rather than ignored.
+        """
+        name = str(shift_type)
+        if name not in ("none", "positive_definite", "nonzero"):
+            raise ValueError(f"unknown shift type: {name}")
+        if name != "none":
+            raise NotImplementedError(
+                f"factor shift {name!r} is not covered by mojo-petsc4py; the"
+                " pivot-retry path (MatPivotCheck) is not ported, so only"
+                " 'none' reproduces upstream"
+            )
+        self._shift_type = name
         if amount is not None:
             self._shift = float(amount)
         self._setupcalled = False
 
     def setFactorPivot(self, flag) -> None:
-        self._zeropivot = float(flag) if not isinstance(flag, bool) else (
+        """Set the zero-pivot tolerance (`PCFactorSetZeroPivot`).
+
+        The port does not run `MatPivotCheck`, so a pivot tolerance cannot be
+        enforced: a nonzero tolerance would be accepted and then ignored, which
+        silently differs from upstream.  Only "no pivot check" (0, or False) is
+        supported; anything else raises.  `True` keeps the historical "100"
+        toggle and raises for the same reason.
+        """
+        tolerance = float(flag) if not isinstance(flag, bool) else (
             100.0 if flag else 0.0
         )
+        if tolerance != 0.0:
+            raise NotImplementedError(
+                "a nonzero factor pivot tolerance is not covered by"
+                " mojo-petsc4py; MatPivotCheck is not ported, so the tolerance"
+                " would be ignored"
+            )
+        self._zeropivot = 0.0
         self._diagonal_fill = bool(flag)
         self._setupcalled = False
 
@@ -369,9 +413,17 @@ class PC:
                 contiguous = True
             if nnz >= 0:
                 if contiguous:
+                    # the L count of each row is `bdiag` until the contiguous
+                    # pass overwrites it with the U-diagonal offsets, and the
+                    # factor rebuild needs it to delimit each L row
+                    bdiag_l = bdiag.copy()
+                    bi_l = bi.copy()
                     lib().mp_ilu_contiguous_lu(
                         addr(bjsrc), addr(bi), addr(bdiag), addr(bj), n
                     )
+                else:
+                    bdiag_l = None
+                    bi_l = None
                 break
             cap = -nnz + n
         ba = np.zeros(max(int(bdiag[0]) + 1, 1), dtype=np.float64)
@@ -384,6 +436,7 @@ class PC:
         # mapped back with the permutation itself, not with its inverse
         self._factor = {
             "bi": bi, "bj": bj, "ba": ba, "bdiag": bdiag, "r": r, "c": r,
+            "nnzL": bdiag_l, "bi_stage": bi_l,
         }
 
     def _build_icc(self, m, n, r, ic, adiag, scratch):
@@ -392,22 +445,35 @@ class PC:
         rinv[r] = np.arange(n, dtype=np.int64)
         while True:
             ui = np.zeros(n + 1, dtype=np.int64)
-            ujsrc = np.zeros(cap, dtype=np.int64)
+            uj = np.zeros(cap, dtype=np.int64)
             ujlvl = np.zeros(cap, dtype=np.int64)
             udiag = np.zeros(n, dtype=np.int64)
+            # the kernel stages each row in `2 * cap` ints that follow the
+            # `6 * (n + 1)` fixed slots, so both blocks grow together
+            need = 6 * (n + 1) + 2 * cap
+            if scratch.size < need:
+                scratch = np.zeros(need, dtype=np.int64)
             nnz = lib().mp_icc_symbolic(
-                addr(ui), addr(ujsrc), addr(ujlvl), addr(udiag), addr(m.irow),
+                addr(ui), addr(uj), addr(ujlvl), addr(udiag), addr(m.irow),
                 addr(m.icol), addr(r), addr(rinv), self._levels, cap,
-                addr(scratch), n,
+                addr(scratch), n, int(scratch.size),
             )
             if nnz >= 0:
                 break
-            cap = -nnz + n
-        # the contiguous pass moves each row into the factor layout (diagonal
-        # last) out of the staging buffer, so the two must be distinct arrays
-        uj = np.zeros(max(int(ui[-1]), 1), dtype=np.int64)
+            cap = -nnz
+        # each row of `uj` still has its diagonal first; the contiguous pass
+        # shifts it last in place and records where each row starts in `bi`,
+        # which is the array the numeric pass and the triangular solve read
+        # `b->diag` is the factor's diagonal slots and `bdiag[n]` the spare
+        # entry the numeric pass reads for the last row's end, so they must
+        # live in one array of n + 1 entries; passing `udiag` itself would
+        # write that spare entry over the last row's diagonal marker.
+        bi = np.zeros(n + 1, dtype=np.int64)
+        bdiag = np.zeros(n + 1, dtype=np.int64)
+        bj = np.zeros(max(cap, int(ui[-1]) + 1), dtype=np.int64)
+        bdiag[:n] = udiag[:n]
         lib().mp_icc_contiguous_cholesky(
-            addr(ui), addr(udiag), addr(ujsrc), addr(uj), n
+            addr(uj), addr(ui), addr(bdiag), addr(bi), addr(bdiag), addr(bj), n
         )
         ua = np.zeros(max(int(ui[-1]), 1), dtype=np.float64)
         rtmp = np.zeros(n, dtype=np.float64)
@@ -415,23 +481,31 @@ class PC:
         c2r = np.zeros(n, dtype=np.int64)
         lib().mp_pc_icc_numeric(
             addr(ua), addr(rtmp), addr(il), addr(c2r), addr(m.irow),
-            addr(m.icol), addr(m.data), addr(ui), addr(uj), addr(udiag),
+            addr(m.icol), addr(m.data), addr(bi), addr(bj), addr(bdiag),
             addr(r), addr(rinv), n,
         )
-        # The IC factor stores L*U with only U present, so the forward solve
-        # walks the transpose of U; build it once here.
-        tirow, ticol, tdata = _csr_transpose(ui, uj, ua, n)
+        # The factor holds U with the diagonal slot in the middle of each row,
+        # which is the SBAIJ layout the solve reads directly; no transpose is
+        # needed.
         self._factor = {
-            "bi": ui, "bj": uj, "ba": ua, "bdiag": udiag, "r": r,
-            "tirow": tirow, "ticol": ticol, "tdata": tdata,
+            "bi": bi, "bj": bj, "ba": ua, "bdiag": bdiag, "r": r,
         }
 
     # ---------------------------------------------------------- apply
     def _pci_block(self, n: int) -> np.ndarray:
-        if self._pci is None or len(self._pci) < 12:
-            self._pci = np.zeros(12, dtype=np.int64)
-        pci = self._pci
-        pci[:] = 0
+        """The preconditioner descriptor the solver reads, built once per setup.
+
+        Resolving a buffer's address costs more than a small kernel runs in
+        (`np.ndarray.ctypes.data` rebuilds a ctypes descriptor, about 1.8 us
+        here), and this block carries a dozen of them.  Nothing in it changes
+        between setups: every buffer it names is allocated by `setUp`, and
+        `setUp` and `reset` both drop this block before they rebuild it, so an
+        address here cannot refer to a previous factor.
+        """
+        cached = self._pci_cache
+        if cached is not None:
+            return cached[0]
+        pci = [0] * 12
         if self._type == PCType.NONE:
             pci[0] = _NONE
         elif self._type == PCType.JACOBI:
@@ -468,10 +542,37 @@ class PC:
                 pci[3] = f["ba"].ctypes.data
                 pci[4] = f["bdiag"].ctypes.data
                 pci[5] = f["r"].ctypes.data
-                pci[6] = f["tirow"].ctypes.data
-                pci[7] = f["ticol"].ctypes.data
-                pci[8] = f["tdata"].ctypes.data
-        return pci
+        block = np.array(pci, dtype=np.int64)
+        self._pci_cache = (block, AddrBuf(block))
+        return block
+
+    def _pci_addr(self, n: int) -> int:
+        """The address of the descriptor block, built once per setup."""
+        self._pci_block(n)
+        return self._pci_cache[1].addr
+
+    def _workspace_addr(self, n: int) -> int:
+        """The address of the length-n scratch the triangular solves use."""
+        if self._pstmp is None or len(self._pstmp) < n:
+            self._pstmp = np.zeros(n, dtype=np.float64)
+            self._pstmp_buf = None
+        cached = self._pstmp_buf
+        if cached is None or cached.array is not self._pstmp:
+            cached = AddrBuf(self._pstmp)
+            self._pstmp_buf = cached
+        return cached.addr
+
+    def _pcf_addr(self) -> int:
+        """The two SOR scalars, written through one list assignment."""
+        if self._pcf is None or len(self._pcf) < 2:
+            self._pcf = np.zeros(2, dtype=np.float64)
+            self._pcf_buf = None
+        cached = self._pcf_buf
+        if cached is None or cached.array is not self._pcf:
+            cached = AddrBuf(self._pcf)
+            self._pcf_buf = cached
+        self._pcf[:] = [self._sor_omega, self._sor_fshift]
+        return cached.addr
 
     def _pcf_block(self) -> np.ndarray:
         if self._pcf is None or len(self._pcf) < 2:
@@ -516,10 +617,9 @@ class PC:
         else:
             f = self._factor
             lib().mp_pc_icc_apply(
-                addr(x.getArray()), addr(y.getArray()), addr(self._workspace(n)),
-                addr(f["bi"]), addr(f["bj"]), addr(f["ba"]), addr(f["bdiag"]),
-                addr(f["r"]), addr(f["tirow"]), addr(f["ticol"]), addr(f["tdata"]),
-                n,
+                addr(x.getArray()), addr(y.getArray()), addr(f["bi"]),
+                addr(f["bj"]), addr(f["ba"]), addr(f["bdiag"]), addr(f["r"]),
+                addr(self._workspace(n)), n,
             )
 
     def apply(self, x: Vec, y: Vec) -> None:
@@ -593,43 +693,41 @@ def _ilu_factor_mat(f) -> Mat:
     """Rebuild the ILU factor as the square CSR matrix L*U, the operator whose
     solve `pc.apply` performs.
 
-    `apply` runs the forward substitution against the L rows and the backward
-    substitution against the U rows, each diagonal already inverted, so the
-    matrix it solves against is L*U with the ordinary diagonal.  The factor
-    stores all L rows in increasing row order, then all U rows in decreasing
-    order, `bdiag[i]` pointing at the diagonal of U(i,:) and `bdiag[n]` at one
-    before its first entry.  `r` is the row ordering and `c` the column
-    ordering, both mapping a permuted index back to the original one.
+    Both sweeps are read off `MatSolve_SeqAIJ` directly.  The forward sweep
+    subtracts `ba[j] * tmp[bj[j]]` over `j = bi[i] .. bi[i + 1]`, so row i of
+    L is the identity plus those strictly lower entries.  The backward sweep
+    starts at `v = bdiag[i + 1] + 1`, walks `nz = bdiag[i] - bdiag[i + 1] - 1`
+    entries and multiplies by `ba[v + nz]`, the inverted diagonal, so U(i,:)
+    is those entries followed by `1 / ba[v + nz]`.  `r` and `c` map a permuted
+    index back to the caller's.
     """
     bi, bj, ba, bdiag, r, c = (
         f["bi"], f["bj"], f["ba"], f["bdiag"], f["r"], f["c"]
     )
     n = len(bi) - 1
-    dense = np.zeros((n, n), dtype=np.float64)
-    # L rows: bi[i] .. bi[i+1] - 1, columns in permuted index space
+    L = np.eye(n)
+    U = np.zeros((n, n))
     for i in range(n):
         for j in range(int(bi[i]), int(bi[i + 1])):
-            dense[int(r[i]), int(c[int(bj[j])])] = ba[j]
-    # U rows: bdiag[i] is the diagonal (stored inverted), then the entries
-    # above it run from bdiag[i+1] + 1 up to bdiag[i] - 1
+            L[int(r[i]), int(c[int(bj[j])])] = ba[j]
     for i in range(n):
-        row = int(r[i])
-        for j in range(int(bdiag[i + 1]) + 1, int(bdiag[i])):
-            dense[row, int(c[int(bj[j])])] = ba[j]
-        # the diagonal slot holds 1 / u_ii, so undo the inversion
-        inv = ba[int(bdiag[i])]
-        dense[row, int(c[i])] = 1.0 / inv if inv != 0.0 else 0.0
-    return from_dense(dense)
+        v = int(bdiag[i + 1]) + 1
+        nz = int(bdiag[i] - bdiag[i + 1] - 1)
+        for j in range(nz):
+            U[int(r[i]), int(c[int(bj[v + j])])] = ba[v + j]
+        U[int(r[i]), int(r[i])] = 1.0 / ba[v + nz]
+    return from_dense(L @ U)
 
 
 def _icc_factor_mat(f) -> Mat:
-    """Rebuild the IC factor as the square CSR matrix L*D*Lᵀ, the operator whose
-    solve `pc.apply` performs.
+    """Rebuild the IC factor as the square CSR matrix L*D*L^T, the operator
+    whose solve `pc.apply` performs.
 
-    The factor keeps only the upper triangle U with the diagonal slot last
-    holding 1/d_k, so L = Uᵀ is recovered from it: the strictly upper slot
-    (k,i) holds -L[i,k], and the diagonal slot holds 1/d_k, so d_k is its
-    reciprocal.  `bj[j]` is the permuted column index, which `r` maps back to
+    The factor stores the strictly upper triangle of A with each row's diagonal
+    slot last, holding 1/d_k.  U^T is the unit-lower L, whose off-diagonal
+    entries are the negated stored slots -- the numeric pass keeps `-L`, as the
+    ILU factor does -- and the diagonal of row i is d_i, the reciprocal of the
+    stored slot.  `bj[j]` is the permuted column index, which `r` maps back to
     the original one.
     """
     bi, bj, ba, bdiag, r = f["bi"], f["bj"], f["ba"], f["bdiag"], f["r"]
@@ -639,11 +737,9 @@ def _icc_factor_mat(f) -> Mat:
     for i in range(n):
         row = int(r[i])
         slot = int(bdiag[i])
-        # strictly upper triangle: slot (k,i) stores -L[i,k]
+        unit[row, row] = 1.0
         for j in range(int(bi[i]), slot):
             unit[int(r[int(bj[j])]), row] = -ba[j]
-        # the diagonal slot stores 1/d_i, so d_i is its reciprocal
         inv = ba[slot]
         d[row] = 1.0 / inv if inv != 0.0 else 0.0
-        unit[row, row] = 1.0
     return from_dense((unit * d) @ unit.T)

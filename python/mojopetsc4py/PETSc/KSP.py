@@ -3,6 +3,11 @@
 Covered types: `cg`, `gmres`, `fgmres`, `bcgs`.  The tolerances, the
 convergence test, the residual history and the converged-reason reporting all
 follow upstream; the iteration itself runs in Mojo.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ import math
 
 import numpy as np
 
-from .._lib import addr, lib
+from .._lib import AddrBuf, addr, lib
 from .Mat import Mat
 from .PC import PC
 from .Vec import Vec, NormType
@@ -150,6 +155,7 @@ class KSP:
         self._vv = None
         self._prevec = None
         self._hs = None
+        self._blkc = {}
 
     # ---------------------------------------------------------- lifecycle
     def create(self, comm=None) -> "KSP":
@@ -310,20 +316,52 @@ class KSP:
         this mirrors.
         """
         if self._work is None or len(self._work) < nwork:
-            self._work = np.zeros(nwork, dtype=np.float64)
+            self._set_blk("_work", np.zeros(nwork, dtype=np.float64))
         elif len(self._work) > nwork:
             self._work[:nwork] = 0.0
         if nvec:
             if self._vv is None or len(self._vv) < nvec:
-                self._vv = np.zeros(nvec, dtype=np.float64)
+                self._set_blk("_vv", np.zeros(nvec, dtype=np.float64))
             elif len(self._vv) > nvec:
                 self._vv[:nvec] = 0.0
         if hs_size:
             if self._hs is None or len(self._hs) < hs_size:
-                self._hs = np.zeros(hs_size, dtype=np.float64)
+                self._set_blk("_hs", np.zeros(hs_size, dtype=np.float64))
             elif len(self._hs) > hs_size:
                 self._hs[:hs_size] = 0.0
         return self._work, self._vv, self._hs
+
+    def _blk(self, name: str):
+        """(array, cached address) for one of the driver's blocks.
+
+        A solve resolves a dozen of these, and `np.ndarray.ctypes.data` costs
+        more per access than a short kernel runs in, so the address is cached
+        beside the array.  The cache entry is keyed on the array's identity and
+        dropped by `_ensure` whenever it reallocates, so an address can never
+        outlive the storage it was taken from.
+        """
+        cached = self._blkc.get(name)
+        array = getattr(self, name)
+        if cached is None or cached.array is not array:
+            if array is None:
+                return None, 0
+            cached = AddrBuf(array)
+            self._blkc[name] = cached
+        return cached.array, cached.addr
+
+    def _set_blk(self, name: str, array) -> None:
+        setattr(self, name, array)
+        self._blkc.pop(name, None)
+
+    def _ensure_prevec(self, size: int):
+        """FGMRES's preconditioned-direction block, grown on demand.
+
+        Every entry is written before it is read, so it is not zeroed; that is
+        what the old `_ensure(0, size, 0)` call did.
+        """
+        if self._prevec is None or len(self._prevec) < size:
+            self._set_blk("_prevec", np.zeros(size, dtype=np.float64))
+        return self._blk("_prevec")
 
     # ---------------------------------------------------------- solve
     def solve(self, b: Vec, x: Vec) -> None:
@@ -353,9 +391,17 @@ class KSP:
 
         self._resolve_normtype()
         cfg, cfgi = self._state(n)
-        pcf = self._pc._pcf_block()
-        pstmp = self._pc._workspace(n)
         am = self._amat
+        i_addr = addr(am.irow)
+        j_addr = addr(am.icol)
+        d_addr = addr(am.data)
+        pci_addr = self._pc._pci_addr(n)
+        pcf_addr = self._pc._pcf_addr()
+        stmp_addr = self._pc._workspace_addr(n)
+        cfg_addr = self._blk("_cfg")[1]
+        cfgi_addr = self._blk("_cfgi")[1]
+        _, b_addr = b._seen()
+        _, x_addr = x._seen()
 
         if self._type in (KSPType.GMRES, KSPType.FGMRES):
             mk = self._restart
@@ -365,33 +411,33 @@ class KSP:
                 (mk + 2) * (mk + 1) + (mk + 1) * (mk + 1)
                 + 2 * (mk + 1) + 2 * (mk + 2)
             )
-            work, vv, hs = self._ensure(2 * n, (mk + 1) * n, hs_size)
+            self._ensure(2 * n, (mk + 1) * n, hs_size)
+            w_addr = self._blk("_work")[1]
+            v_addr = self._blk("_vv")[1]
+            h_addr = self._blk("_hs")[1]
             if self._type == KSPType.GMRES:
                 lib().mp_ksp_solve_gmres(
-                    n, addr(am.irow), addr(am.icol), addr(am.data),
-                    addr(self._pc._pci_block(n)), addr(pcf), addr(pstmp),
-                    addr(work), addr(vv), addr(hs), addr(cfg), addr(cfgi),
-                    addr(b.getArray()), addr(x.getArray()),
+                    n, i_addr, j_addr, d_addr, pci_addr, pcf_addr, stmp_addr,
+                    w_addr, v_addr, h_addr, cfg_addr, cfgi_addr,
+                    b_addr, x_addr,
                 )
             else:
-                prevec = self._ensure(0, (mk + 2) * n, 0)[1]
+                pv_addr = self._ensure_prevec((mk + 2) * n)[1]
                 lib().mp_ksp_solve_fgmres(
-                    n, addr(am.irow), addr(am.icol), addr(am.data),
-                    addr(self._pc._pci_block(n)), addr(pcf), addr(pstmp),
-                    addr(work), addr(vv), addr(prevec), addr(hs), addr(cfg),
-                    addr(cfgi), addr(b.getArray()), addr(x.getArray()),
+                    n, i_addr, j_addr, d_addr, pci_addr, pcf_addr, stmp_addr,
+                    w_addr, v_addr, pv_addr, h_addr, cfg_addr, cfgi_addr,
+                    b_addr, x_addr,
                 )
         else:
-            work, _vv, _hs = self._ensure(7 * n, 0, 0)
+            self._ensure(7 * n, 0, 0)
+            w_addr = self._blk("_work")[1]
             entry = (
                 lib().mp_ksp_solve_cg if self._type == KSPType.CG
                 else lib().mp_ksp_solve_bcgs
             )
             entry(
-                n, addr(am.irow), addr(am.icol), addr(am.data),
-                addr(self._pc._pci_block(n)), addr(pcf), addr(pstmp),
-                addr(work), addr(cfg), addr(cfgi), addr(b.getArray()),
-                addr(x.getArray()),
+                n, i_addr, j_addr, d_addr, pci_addr, pcf_addr, stmp_addr,
+                w_addr, cfg_addr, cfgi_addr, b_addr, x_addr,
             )
 
         self._its = int(cfgi[10])
@@ -413,7 +459,7 @@ class KSP:
         docstring for the layout."""
         size = 16 + self._max_it + 2
         if self._cfg is None or len(self._cfg) < size:
-            self._cfg = np.zeros(size, dtype=np.float64)
+            self._set_blk("_cfg", np.zeros(size, dtype=np.float64))
         cfg = self._cfg
         # the residual history is the one part of this block the driver only
         # appends to, so it is cleared rather than left from the last solve
@@ -425,7 +471,7 @@ class KSP:
         cfg[4] = self._breakdowntol
         cfg[6] = 0.0
         if self._cfgi is None:
-            self._cfgi = np.zeros(16, dtype=np.int64)
+            self._set_blk("_cfgi", np.zeros(16, dtype=np.int64))
         cfgi = self._cfgi
         cfgi[0] = self._normtype
         cfgi[1] = self._pc_side

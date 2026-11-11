@@ -70,15 +70,15 @@ _SIGNATURES = {
     "mp_pc_jacobi_apply": ([I, I, I, I], None),
     "mp_pc_sor_apply": ([I, I, I, I, I, I, I, I, I, F, F, I, I], None),
     "mp_pc_ilu_apply": ([I] * 10, None),
-    "mp_pc_icc_apply": ([I] * 12, I),
+    "mp_pc_icc_apply": ([I] * 9, I),
     "mp_pc_ilu_numeric": ([I] * 11, I),
     "mp_pc_icc_numeric": ([I] * 13, None),
     "mp_ilu_symbolic_ilu0": ([I] * 7, I),
     "mp_ilu_symbolic": ([I] * 12, I),
-    "mp_icc_symbolic": ([I] * 12, I),
+    "mp_icc_symbolic": ([I] * 13, I),
     "mp_ilu_contiguous_lu": ([I] * 5, None),
     "mp_ordering_rcm": ([I] * 7, None),
-    "mp_icc_contiguous_cholesky": ([I] * 5, None),
+    "mp_icc_contiguous_cholesky": ([I] * 7, None),
     # KSP
     "mp_ksp_solve_cg": ([I] * 12, None),
     "mp_ksp_solve_bcgs": ([I] * 12, None),
@@ -152,7 +152,39 @@ def i64(a) -> np.ndarray:
     return np.ascontiguousarray(a, dtype=np.int64)
 
 
-def addr(a: np.ndarray) -> int:
+class AddrBuf:
+    """A buffer and its data address, resolved once.
+
+    `np.ndarray.ctypes.data` rebuilds a ctypes descriptor on every access, which
+    measures at 1.8 us here against 1.3 us for the FFI call it feeds; a Krylov
+    solve resolves a dozen such addresses per iteration.  Resolving it once and
+    keeping the plain int costs 145 ns to read back.
+
+    The buffer is written once, when the owner allocates it.  A buffer that is
+    swapped for a new allocation must go through `set` so the address moves with
+    it; rebinding the ndarray behind an `AddrBuf`'s back would leave the cached
+    address pointing at freed storage.  `array` is kept for its reference, so
+    the address cannot outlive the storage.
+    """
+
+    __slots__ = ("array", "addr")
+
+    def __init__(self, array: np.ndarray):
+        self.array = array
+        self.addr = array.ctypes.data
+
+    def set(self, array: np.ndarray) -> None:
+        self.array = array
+        self.addr = array.ctypes.data
+
+    def __len__(self) -> int:
+        return len(self.array)
+
+
+def addr(a) -> int:
+    """The data address of `a`, or of the buffer behind an `AddrBuf`."""
+    if isinstance(a, AddrBuf):
+        return a.addr
     return a.ctypes.data
 
 

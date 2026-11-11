@@ -18,6 +18,11 @@ arguments and an `ImplicitlyCopyable` conformance that a state struct of this
 shape does not get for free.  Solver state therefore travels as a caller-owned
 scalar block (`st`, `sit`) exactly as PETSc's `ksp->its` / `ksp->rnorm` do, and
 the work vectors travel as one flat `Float64` arena sliced by index.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from std.math import abs, exp, log, sqrt
@@ -630,22 +635,27 @@ def PCApply_SOR(
     idiag: Ptr, mdiag: Ptr, t: Ptr, omega: Float64, fshift: Float64, its: Int,
     lits: Int, flag: Int, nrow: Int
 ):
-    """sorc.c PCApply_SOR -> aij.c MatSOR_SeqAIJ, one `its * lits` sweep block.
+    """sorc.c PCApply_SOR -> aij.c MatSOR_SeqAIJ, the `its * lits` sweep block.
 
-    The default PCSOR configuration is a symmetric local sweep with
-    SOR_ZERO_INITIAL_GUESS, which performs exactly one symmetric sweep in the
-    zero-guess prologue and then leaves `its` at zero, so the main loop does
-    not run.  That structure is kept verbatim.
+    `x` is the right-hand side (upstream's `b`) and `y` the solution vector
+    (upstream's `x`).  Upstream keeps a local `xb` that is either its `b` or
+    its checkpoint array `t`, and the two cases take different arithmetic in
+    the backward sweep; `use_t` below is that `xb == t` test, spelled out
+    because a pointer comparison has no direct equivalent here.
+
+    The zero-initial-guess prologue decrements `its` itself, so the default
+    single symmetric sweep with its = 1 runs once there and leaves the main
+    loop with nothing to do.
     """
-    var i = its * lits
+    var it = its * lits
     MatInvertDiagonalForSOR_SeqAIJ(
         idiag, mdiag, dmark, arow, acol, adata, omega, fshift, nrow
     )
 
-    # zero-initial-guess prologue
-    var xb = t
+    # SOR_ZERO_INITIAL_GUESS
+    var use_t = 0
     if flag & (SOR_FORWARD_SWEEP | SOR_LOCAL_FORWARD_SWEEP):
-        i = 0
+        var i = 0
         while i < nrow:
             var sum = x.unsafe_load(i)
             var j = arow.unsafe_load(i)
@@ -656,58 +666,88 @@ def PCApply_SOR(
             t.unsafe_store(i, sum)
             y.unsafe_store(i, sum * idiag.unsafe_load(i))
             i += 1
+        use_t = 1
     if flag & (SOR_BACKWARD_SWEEP | SOR_LOCAL_BACKWARD_SWEEP):
-        i = nrow - 1
+        var i = nrow - 1
         while i >= 0:
-            var sum = xb.unsafe_load(i)
+            var sum = (t if use_t else x).unsafe_load(i)
             var j = dmark.unsafe_load(i) + 1
             var jend = arow.unsafe_load(i + 1)
             while j < jend:
                 sum -= adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
                 j += 1
-            y.unsafe_store(
-                i, (1.0 - omega) * y.unsafe_load(i) + sum * idiag.unsafe_load(i)
-            )
+            if use_t:
+                y.unsafe_store(
+                    i,
+                    (1.0 - omega) * y.unsafe_load(i) + sum * idiag.unsafe_load(i),
+                )
+            else:
+                y.unsafe_store(i, sum * idiag.unsafe_load(i))
             i -= 1
-    i -= 1
+    it -= 1
 
-    # main loop
-    while i > 0:
-        i -= 1
+    # `while (its--)`: the test is against the value before the decrement
+    while it > 0:
+        it -= 1
         if flag & (SOR_FORWARD_SWEEP | SOR_LOCAL_FORWARD_SWEEP):
-            var k = 0
-            while k < nrow:
+            var i = 0
+            while i < nrow:
                 # lower
-                var sum = x.unsafe_load(k)
-                var j = arow.unsafe_load(k)
-                var jend = dmark.unsafe_load(k)
+                var sum = x.unsafe_load(i)
+                var j = arow.unsafe_load(i)
+                var jend = dmark.unsafe_load(i)
                 while j < jend:
                     sum -= adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
                     j += 1
-                t.unsafe_store(k, sum)
+                t.unsafe_store(i, sum)
                 # upper
-                j = dmark.unsafe_load(k) + 1
-                jend = arow.unsafe_load(k + 1)
+                j = dmark.unsafe_load(i) + 1
+                jend = arow.unsafe_load(i + 1)
                 while j < jend:
                     sum -= adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
                     j += 1
                 y.unsafe_store(
-                    k, (1.0 - omega) * y.unsafe_load(k) + sum * idiag.unsafe_load(k)
+                    i,
+                    (1.0 - omega) * y.unsafe_load(i) + sum * idiag.unsafe_load(i),
                 )
-                k += 1
+                i += 1
+            use_t = 1
         if flag & (SOR_BACKWARD_SWEEP | SOR_LOCAL_BACKWARD_SWEEP):
-            var k = nrow - 1
-            while k >= 0:
-                var sum = t.unsafe_load(k)
-                var j = dmark.unsafe_load(k) + 1
-                var jend = arow.unsafe_load(k + 1)
-                while j < jend:
-                    sum -= adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
-                    j += 1
-                y.unsafe_store(
-                    k, (1.0 - omega) * y.unsafe_load(k) + sum * idiag.unsafe_load(k)
-                )
-                k -= 1
+            var i = nrow - 1
+            while i >= 0:
+                var sum = (t if use_t else x).unsafe_load(i)
+                if use_t:
+                    # the lower part was checkpointed, so only U applies
+                    var j = dmark.unsafe_load(i) + 1
+                    var jend = arow.unsafe_load(i + 1)
+                    while j < jend:
+                        sum -= (
+                            adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
+                        )
+                        j += 1
+                    y.unsafe_store(
+                        i,
+                        (1.0 - omega) * y.unsafe_load(i)
+                        + sum * idiag.unsafe_load(i),
+                    )
+                else:
+                    # the whole matrix (no checkpointing available)
+                    var j = arow.unsafe_load(i)
+                    var jend = arow.unsafe_load(i + 1)
+                    while j < jend:
+                        sum -= (
+                            adata.unsafe_load(j) * y.unsafe_load(acol.unsafe_load(j))
+                        )
+                        j += 1
+                    y.unsafe_store(
+                        i,
+                        (1.0 - omega) * y.unsafe_load(i)
+                        + (sum + mdiag.unsafe_load(i) * y.unsafe_load(i))
+                        * idiag.unsafe_load(i),
+                    )
+                i -= 1
+
+
 
 
 
@@ -722,6 +762,10 @@ def LLInsertLocation(
 ) -> Tuple[Int, Int]:
     """matimpl.h PetscLLInsertLocation_Private.  Returns (nlnk, lnkdata)."""
     var ld = lnkdata
+    # `assume_sorted` says the caller's index set is ascending, so resuming
+    # from the last inserted entry is safe.  When it is not, every insertion
+    # restarts the scan from the head, which is what upstream's `k != 0 and
+    # entry < lnkdata` guard is for.
     if not assume_sorted and k != 0 and entry < ld:
         ld = idx_start
     var location = ld
@@ -735,6 +779,9 @@ def LLInsertLocation(
             walking = False
     lnk.unsafe_store(location, entry)
     lnk.unsafe_store(entry, ld)
+    # upstream leaves `lnkdata` on the new entry, so the next -- always larger
+    # -- insertion resumes there instead of rescuing from the predecessor
+    # and splicing before its own position
     return (nlnk + 1, entry)
 
 
@@ -853,50 +900,58 @@ def ILUApplyFactor_SeqAIJ(
 
 
 def ICCApplyFactor_SeqAIJ(
-    b: Ptr, x: Ptr, y: Ptr, ui: PI, uj: PI, ua: Ptr, udiag: PI, r: PI,
-    tirow: PI, ticol: PI, tdata: Ptr, nrow: Int
+    b: Ptr, x: Ptr, ui: PI, uj: PI, ua: Ptr, udiag: PI, c: PI,
+    scratch: Ptr, nrow: Int
 ) -> Int:
-    """Solve with the IC(levels) factor, which PETSc stores as L*D*Lᵀ with only
-    the upper triangle present: the strict upper slot (i, k) holds -L[k, i] and
-    the diagonal slot holds 1/d_i, the reciprocal of the pivot.
+    """sbaijfact2.c MatSolve_SeqSBAIJ_1_inplace, on the IC factor.
 
-    The two sweeps are the forward solve for the unit-lower L and the backward
-    solve for Lᵀ with the diagonal divided in between, as
-    `baij/seq/baijsolvnat1.c` does.  L's strictly-lower part is the transpose of
-    the stored upper triangle, so the forward sweep walks the transpose
-    pattern `tirow`/`ticol`/`tdata` that the setup builds alongside the factor.
-    With a permutation the solve happens in the permuted index space, and `r`
-    maps back.
+    The factor stores `U` with each row's diagonal last, so row i is
+    `ui[i] .. udiag[i]`, `udiag[i] == ui[i + 1] - 1`, and the diagonal slot
+    holds `1/d_i`.  Upstream solves `Uᵀ D y = perm(b)` forwards, adding
+    `U(i,j) * y(i)` into `y(j)` for j < i, and `U perm(x) = y` backwards, which
+    are the two sweeps below.
+
+    `x` is the solution and `b` the right-hand side; `scratch` is a length-n
+    work vector.  `c` is the column permutation, applied once as `b` is gathered
+    and once per row as the back substitution writes `x`: a row reads only
+    columns above its diagonal, and those have already been written by the rows
+    below it, so the two orderings do not meet before they are final.
     """
     if not nrow:
         return 0
-    # forward solve the unit-lower factor: y[i] = b[i] - sum_k L[i,k] y[k]
+    # forward: Uᵀ D y = b, with b gathered into the factor's ordering once
     var i = 0
     while i < nrow:
-        var sum = b.unsafe_load(r.unsafe_load(i))
-        var j = tirow.unsafe_load(i)
-        var jend = tirow.unsafe_load(i + 1)
-        while j < jend:
-            var k = ticol.unsafe_load(j)
-            if k < i:
-                # the stored value is -L[i, k]
-                sum += tdata.unsafe_load(j) * y.unsafe_load(k)
-            j += 1
-        y.unsafe_store(i, sum)
+        scratch.unsafe_store(i, b.unsafe_load(c.unsafe_load(i)))
         i += 1
-    # backward solve Lᵀ: the diagonal enters the pivot only, so it scales y[i]
-    # alone and not the accumulated strict-upper term
-    i = nrow - 1
+    i = 0
+    while i < nrow:
+        var xi = scratch.unsafe_load(i)
+        var j = ui.unsafe_load(i)
+        var jend = udiag.unsafe_load(i)  # excludes the diagonal
+        while j < jend:
+            var k = uj.unsafe_load(j)
+            scratch.unsafe_store(k, scratch.unsafe_load(k) + ua.unsafe_load(j) * xi)
+            j += 1
+        scratch.unsafe_store(i, xi * ua.unsafe_load(udiag.unsafe_load(i)))
+        i += 1
+    # backward: U z = y, scattered straight into the caller's ordering; its
+    # rows read columns strictly above the diagonal, which this row still writes
+    i = nrow - 2
     while i >= 0:
-        var sum = y.unsafe_load(i) * ua.unsafe_load(udiag.unsafe_load(i))
+        var xi = scratch.unsafe_load(i)
         var j = ui.unsafe_load(i)
         var jend = udiag.unsafe_load(i)
         while j < jend:
-            sum += ua.unsafe_load(j) * x.unsafe_load(uj.unsafe_load(j))
+            xi += ua.unsafe_load(j) * scratch.unsafe_load(uj.unsafe_load(j))
             j += 1
-        x.unsafe_store(r.unsafe_load(i), sum)
+        scratch.unsafe_store(i, xi)
+        x.unsafe_store(c.unsafe_load(i), xi)
         i -= 1
+    x.unsafe_store(c.unsafe_load(nrow - 1), scratch.unsafe_load(nrow - 1))
     return 0
+
+
 
 
 def MatILUFactorNumeric_SeqAIJ(
@@ -988,6 +1043,12 @@ def MatICCFactorNumeric_SeqAIJ(
 ):
     """aijfact.c MatCholeskyFactorNumeric_SeqAIJ with shift type `none`.
 
+    The factor rows are the layout `MatICCFreeSpaceContiguousCholesky`
+    produced: row k is its strictly lower columns ascending and then the
+    diagonal slot, so `bdiag[k] == bi[k + 1] - 1`.  `b->i` reaches one entry
+    past the factor and the last U(i,:) scan reads it; that entry rides in
+    `bdiag[nrow]` (see the same function).
+
     `il` and `c2r` carry the row-update bookkeeping: `il[i]` is the first
     nonzero of U(i,k:) and `c2r` chains the rows that touch a given column.
     """
@@ -1008,7 +1069,8 @@ def MatICCFactorNumeric_SeqAIJ(
             rtmp.unsafe_store(bj.unsafe_load(jj), 0.0)
             jj += 1
             j += 1
-        # load the upper triangular part of the unfactored row
+        # load the stored (lower) part of the unfactored row, blanking the
+        # slots the factors will occupy
         var bval = bi.unsafe_load(k)
         j = arow.unsafe_load(r.unsafe_load(k))
         jend = arow.unsafe_load(r.unsafe_load(k) + 1)
@@ -1016,7 +1078,7 @@ def MatICCFactorNumeric_SeqAIJ(
             var col = riip.unsafe_load(acol.unsafe_load(j))
             if col >= k:
                 rtmp.unsafe_store(col, adata.unsafe_load(j))
-                ba.unsafe_store(bval, 0.0)
+                ba.unsafe_store(bval, 0.0)  # for in-place factorization
                 bval += 1
             j += 1
 
@@ -1034,8 +1096,10 @@ def MatICCFactorNumeric_SeqAIJ(
             if jmin < jmax:
                 j = jmin
                 while j < jmax:
-                    var c = bj.unsafe_load(j)
-                    rtmp.unsafe_store(c, rtmp.unsafe_load(c) + uikdi * ba.unsafe_load(j))
+                    var cc = bj.unsafe_load(j)
+                    rtmp.unsafe_store(
+                        cc, rtmp.unsafe_load(cc) + uikdi * ba.unsafe_load(j)
+                    )
                     j += 1
                 il.unsafe_store(i, jmin)
                 var cj = bj.unsafe_load(jmin)

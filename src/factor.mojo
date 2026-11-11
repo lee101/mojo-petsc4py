@@ -18,6 +18,11 @@ Two divergences, both in allocation only:
   pivot chain, the first-nonzero map and the column staging buffer) instead of
   five separate allocations.  PETSc's `PetscBT` bit array is kept here as a
   byte array, which is observationally identical.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from ported import *
@@ -66,9 +71,10 @@ def MatILUFactorSymbolic_SeqAIJ(
     bi: PI, bj: PI, bjlvl: PI, bdiag: PI, arow: PI, acol: PI, r: PI, ic: PI,
     levels: Int, cap: Int, scratch: PI, nrow: Int
 ) -> Int:
-    # `bj` here is the contiguous staging array; MatILUFreeSpaceContiguousLU
-    # rearranges it into the final factor layout afterwards.
-    """aijfact.c MatILUFactorSymbolic_SeqAIJ, the level-of-fill case.
+    """`bj` here is the contiguous staging array; MatILUFreeSpaceContiguousLU
+    rearranges it into the final factor layout afterwards.
+
+    aijfact.c MatILUFactorSymbolic_SeqAIJ, the level-of-fill case.
 
     Returns the number of factor entries, or its negation when `cap` was too
     small and the caller should retry with that many.
@@ -118,7 +124,7 @@ def MatILUFactorSymbolic_SeqAIJ(
 
 def MatICCFactorSymbolic_SeqAIJ(
     ui: PI, uj: PI, ujlvl: PI, udiag: PI, arow: PI, acol: PI, rip: PI, riip: PI,
-    levels: Int, cap: Int, scratch: PI, nrow: Int
+    levels: Int, cap: Int, scratch: PI, nrow: Int, scratchlen: Int
 ) -> Int:
     """aijfact.c MatICCFactorSymbolic_SeqAIJ, the level-of-fill case.
 
@@ -126,14 +132,27 @@ def MatICCFactorSymbolic_SeqAIJ(
     entry of each row, so `udiag[i]` points at the diagonal and the strict
     upper triangle runs from `ui[i]` to `udiag[i] - 1`.  Returns the number of
     factor entries, negated when `cap` was too small.
+
+    `scratchlen` is the caller's allocation size; the staging block the merge
+    needs is `2 * cap` ints laid out after `6 * (nrow + 1)`, so a caller that
+    undersizes it is told how much to allocate instead of writing past the end.
     """
     var nlnk = nrow + 1
+    if 6 * nlnk + 2 * cap > scratchlen:
+        return -(6 * nlnk + 2 * cap)
     var lnk = scratch
     var lnklvl = scratch.unsafe_offset(nlnk)
     var bt = scratch.unsafe_offset(2 * nlnk)
     var jl = scratch.unsafe_offset(3 * nlnk)
     var il = scratch.unsafe_offset(4 * nlnk)
     var ajtmp = scratch.unsafe_offset(5 * nlnk)
+    # upstream stages each row in a PetscFreeSpaceList block of its own
+    # (`uj_ptr[k]`) rather than directly in `uj`; the two are separate
+    # allocations precisely because a pivot row is re-read after the row that
+    # consumed it has been written.  One flat staging block, one slot per row,
+    # plus the level block the merge rule needs.
+    var ujtmp = scratch.unsafe_offset(6 * nlnk)
+    var ujtmp_lvl = scratch.unsafe_offset(6 * nlnk + cap)
     var i = 0
     while i < nrow:
         jl.unsafe_store(i, nrow)
@@ -151,11 +170,25 @@ def MatICCFactorSymbolic_SeqAIJ(
         var j = 0
         while j < ncols:
             var col = acol.unsafe_load(arow.unsafe_load(rk) + j)
-            if riip.unsafe_load(col) >= k:  # upper triangular entries only
+            # PETSc's SBAIJ IC factor stores the strictly upper triangle of A
+            # plus the diagonal, with the diagonal last in each row -- the
+            # layout MatGetRowIJ reports on a real IC factor.  Keeping only
+            # the strict entries here leaves the diagonal to be appended.
+            if riip.unsafe_load(col) > k:
                 ajtmp.unsafe_store(ncols_upper, col)
                 ncols_upper += 1
             j += 1
         nzk += IncompleteLLInit(ncols_upper, ajtmp, nrow, riip, lnk, lnklvl, bt)
+        # row k's diagonal k is in A's pattern, so the init above added it; if
+        # the input row somehow lacks it, insert it as upstream's
+        # "make sure the active row has diagonal entry" check requires
+        if bt.unsafe_load(rk) == 0:
+            var r2 = LLInsertLocation(
+                0, ncols_upper, nrow, rk, nzk, nrow, lnk
+            )
+            nzk = r2[0]
+            lnklvl.unsafe_store(rk, 0)
+            bt.unsafe_store(rk, 1)
 
         # `ui[k]` is still unwritten at this point in upstream too; every read of
         # it below is a read of the value `ui[k+1]` was given on the previous
@@ -165,18 +198,22 @@ def MatICCFactorSymbolic_SeqAIJ(
         var prow = jl.unsafe_load(k)
         while prow < k:
             var nextprow = jl.unsafe_load(prow)
-            var jmin = il.unsafe_load(prow) + 1
+            var jmin = il.unsafe_load(prow) + 1  # 2nd nonzero of U(prow,k:)
             var jmax = ui.unsafe_load(prow + 1)
             var ncols2 = jmax - jmin
+            # i = jmin - ui[prow]; `cols` is then U(prow,:)'s second entry, and
+            # `uj - 1` is the level of U(prow,k) itself
+            var pbase = jmin - ui.unsafe_load(prow)
+            var cols = ujtmp.unsafe_offset(pbase)
+            var colslvl = ujtmp_lvl.unsafe_offset(pbase)
             if ncols2 > 0:
-                var cols = uj.unsafe_offset(ui.unsafe_load(prow) + jmin - ui.unsafe_load(prow))
-                var colslvl = ujlvl.unsafe_offset(ui.unsafe_load(prow) + jmin - ui.unsafe_load(prow))
                 # PetscICCLLAddSorted offsets by the level of U(prow,prow),
                 # which is the entry before the 2nd nonzero of U(prow,:)
                 nzk += IncompleteLLAdd(
                     ncols2, cols, Float64(levels), colslvl, nrow, lnk, lnklvl, bt,
                     colslvl.unsafe_load(-1), 1
                 )
+            if jmin < jmax:
                 il.unsafe_store(prow, jmin)
                 var cj = cols.unsafe_load(0)
                 jl.unsafe_store(prow, jl.unsafe_load(cj))
@@ -188,14 +225,48 @@ def MatICCFactorSymbolic_SeqAIJ(
         # PetscLLClean writes exactly `nzk` entries: the diagonal is the first
         # of them, because the list is sorted and the diagonal k is its minimum.
         IncompleteLLClean(
-            nrow, nrow, nzk, lnk, lnklvl, uj.unsafe_offset(uk),
-            ujlvl.unsafe_offset(uk), bt
+            nrow, nrow, nzk, lnk, lnklvl, ujtmp.unsafe_offset(0),
+            ujtmp_lvl.unsafe_offset(0), bt
         )
         if nzk > 1:
-            var cj = uj.unsafe_load(uk + 1)
+            var cj = ujtmp.unsafe_load(1)
             jl.unsafe_store(k, jl.unsafe_load(cj))
             jl.unsafe_store(cj, k)
             il.unsafe_store(k, uk + 1)
+        # The list drains in ascending column order with the diagonal k first
+        # (it is the smallest index in row k), so rotating it left by one
+        # leaves the strict columns ascending with the diagonal last -- the
+        # factor layout.  The entries are written out from their drained
+        # positions, not assumed to be in column order.
+        var diag_at = -1
+        var c = 0
+        while c < nzk:
+            if ujtmp.unsafe_load(c) == rk:
+                diag_at = c
+                break
+            c += 1
+        var w = 0
+        c = 0
+        while c < nzk:
+            if c != diag_at:
+                uj.unsafe_store(uk + w, ujtmp.unsafe_load(c))
+                ujlvl.unsafe_store(uk + w, ujtmp_lvl.unsafe_load(c))
+                w += 1
+            c += 1
+        # insertion sort of the strict part: the drained list is sorted when
+        # every merge source is sorted, which the level-of-fill merges only
+        # guarantee for the columns they were handed, not in general
+        c = 1
+        while c < w:
+            var key = uj.unsafe_load(uk + c)
+            var kk = c - 1
+            while kk >= 0 and uj.unsafe_load(uk + kk) > key:
+                uj.unsafe_store(uk + kk + 1, uj.unsafe_load(uk + kk))
+                kk -= 1
+            uj.unsafe_store(uk + kk + 1, key)
+            c += 1
+        uj.unsafe_store(uk + nzk - 1, rk)
+        ujlvl.unsafe_store(uk + nzk - 1, ujtmp_lvl.unsafe_load(diag_at))
         udiag.unsafe_store(k, uk + nzk - 1)
         ui.unsafe_store(k + 1, uk + nzk)
         k += 1
@@ -311,28 +382,31 @@ def MatILUFreeSpaceContiguousLU(
 
 
 def MatICCFreeSpaceContiguousCholesky(
-    ujsrc: PI, ui: PI, udiag: PI, uj: PI, n: Int
+    ujsrc: PI, ui: PI, udiag: PI, bi: PI, bdiag: PI, bj: PI, n: Int
 ):
     """freespace.c PetscFreeSpaceContiguous_Cholesky.
 
-    The symbolic phase lays row k out in the order the linked list drains, so
-    the staging array has the diagonal k first (the list is sorted and k is its
-    minimum) followed by the rest of U(k,:) in ascending order.  The factor
-    wants the diagonal last, with the strictly upper triangle before it.
+    The symbolic phase already lays each row out as the factor wants it --
+    strictly lower columns ascending, then the diagonal slot, which is the
+    last entry and also `udiag[row]` -- so this is a copy out of the staging
+    buffer into the factor's arrays, plus the two pointer arrays.
 
-    Upstream copies the staging rows into a separately allocated `uj`; this
-    does the same, because shifting each row down by one in place would read
-    the source from `base + j` and the write to `base + j` has already
-    overwritten the *next* row's first entry.
+    `b->i` is `bi[row] = udiag[row - 1] + 1`; upstream allocates it one entry
+    longer than the factor needs, and the numeric pass reads the last row's end
+    from that spare entry, carried here in `bdiag[n]`.
     """
     var row = 0
     while row < n:
-        var base = ui.unsafe_load(row)
-        var nnz = ui.unsafe_load(row + 1) - base - 1
-        udiag.unsafe_store(row, ui.unsafe_load(row + 1) - 1)
-        var j = 0
-        while j < nnz:
-            uj.unsafe_store(base + j, ujsrc.unsafe_load(base + j + 1))
+        var j = ui.unsafe_load(row)
+        var jend = udiag.unsafe_load(row) + 1
+        while j < jend:
+            bj.unsafe_store(j, ujsrc.unsafe_load(j))
             j += 1
-        uj.unsafe_store(base + nnz, ujsrc.unsafe_load(base))
         row += 1
+    if n:
+        bi.unsafe_store(0, 0)
+        row = 0
+        while row < n:
+            bi.unsafe_store(row + 1, udiag.unsafe_load(row) + 1)
+            row += 1
+        bdiag.unsafe_store(n, bi.unsafe_load(n))

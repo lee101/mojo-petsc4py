@@ -359,11 +359,20 @@ def test_factor_levels_add_fill_and_match_upstream():
         apply_with(setFactorLevels=0), apply_with(setFactorLevels=2), atol=1e-12
     )
 
-    # the remaining knobs are accepted and leave a finite factor
-    for shift_type in ("none", "positive_definite"):
-        assert np.all(np.isfinite(apply_with(setFactorShift=shift_type)))
-    for pivot in (0.0, 1e-12, 100.0):
-        assert np.all(np.isfinite(apply_with(setFactorPivot=pivot)))
+    # the unported pivot knobs must refuse rather than silently differ: upstream
+    # retries the factorisation on a shift, the port does not
+    for shift_type in ("positive_definite", "nonzero"):
+        with pytest.raises(NotImplementedError):
+            apply_with(setFactorShift=shift_type)
+    with pytest.raises(ValueError):
+        apply_with(setFactorShift="inbit")
+    apply_with(setFactorShift="none")
+    # a pivot tolerance is not enforced either: 0 means "no check", which is
+    # what the port does, and a real tolerance must refuse
+    assert np.all(np.isfinite(apply_with(setFactorPivot=0.0)))
+    for pivot in (1e-12, 100.0, True):
+        with pytest.raises(NotImplementedError):
+            apply_with(setFactorPivot=pivot)
 
 
 # ------------------------------------------------------------------ KSP

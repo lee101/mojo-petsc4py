@@ -1,6 +1,11 @@
 """Matrix types and operations, mirroring `petsc4py/PETSc/Mat.pyx`.
 
 Sequential `MATSEQAIJ` only: compressed sparse row with `int64` index arrays.
+
+
+Transcribed from PETSc 3.25.5 / petsc4py 3.25.5 (BSD-2-Clause); see NOTICE
+at the repository root for their copyright notices, and LICENSE for this
+file's own MIT licence.
 """
 
 from __future__ import annotations
@@ -35,9 +40,19 @@ class MatInfoType:
     ROW_ZERO_TOLERANCE = "rcond"
 
 
+class MatStructures:
+    """`MatStructure` (`Mat.Structure` upstream): the copy modes `compose`
+    and `copy` take."""
+
+    SAME_NONZERO_PATTERN = 2
+    DIFFERENT_NONZERO_PATTERN = 0
+
+    SAME = SAME_NONZERO_PATTERN
+    DIFFERENT = DIFFERENT_NONZERO_PATTERN
+
+
 class MatOrderingType:
     """Matrix ordering types (`MatOrderingType` in Mat.pyx)."""
-
     NATURAL = "natural"
     ND = "nd"
     RCM = "rcm"
@@ -80,6 +95,7 @@ class Mat:
     Type = MatType
     InfoType = MatInfoType
     OrderingType = MatOrderingType
+    Structure = MatStructures
     SORType = MatSORType
 
     def __init__(self):
@@ -145,10 +161,46 @@ class Mat:
         return out
 
     def copy(self, result=None, structure=None) -> "Mat":
-        target = self.duplicate() if result is None else result
-        target._irow[:] = self._irow
-        target._icol[:] = self._icol
-        target._data[:] = self._data
+        """Copy this matrix into `result` (a duplicate when `None`).
+
+        The pending-entry dict is flushed first, so a copy taken before the
+        source is assembled holds the same entries as one taken after.  With
+        the default structure (or `SAME_NONZERO_PATTERN`) the target gets the
+        source's CSR arrays.  With `DIFFERENT_NONZERO_PATTERN` the target keeps
+        its own pattern and receives the values of the entries it already has,
+        as `MatCopy` does: an entry the target does not hold is dropped, and one
+        it holds and the source lacks becomes zero.
+        """
+        source = self
+        source._materialize()
+        target = source.duplicate() if result is None else result
+        if structure == MatStructures.DIFFERENT_NONZERO_PATTERN:
+            target._materialize()
+            if (target._nrows, target._ncols) != (source._nrows, source._ncols):
+                raise ValueError(
+                    f"incompatible sizes: {source.getSize()} into"
+                    f" {target.getSize()}"
+                )
+            src = {
+                (int(source._icol[j]), i): float(source._data[j])
+                for i in range(source._nrows)
+                for j in range(int(source._irow[i]), int(source._irow[i + 1]))
+            }
+            trow, tcol, _ = target.getValuesCSR()
+            newdata = np.zeros(len(tcol), dtype=np.float64)
+            for i in range(target._nrows):
+                for j in range(int(trow[i]), int(trow[i + 1])):
+                    newdata[j] = src.get((int(tcol[j]), i), 0.0)
+            target._data[: len(newdata)] = newdata
+            return target
+        target._nrows = source._nrows
+        target._ncols = source._ncols
+        target._irow = source._irow.copy()
+        target._icol = source._icol.copy()
+        target._data = source._data.copy()
+        target._nnz_used = source._nnz_used
+        target._assembled = source._assembled
+        target._pending = None
         return target
 
     def destroy(self) -> "Mat":
@@ -179,11 +231,10 @@ class Mat:
         """Set every stored entry to zero, keeping the nonzero structure, as
         upstream's `MatZeroEntries` does."""
         self._check()
-        if self._pending is not None:
-            for cols in self._pending.values():
-                for c in cols:
-                    cols[c] = 0.0
         self._materialize()
+        # every stored value is cleared, including one that was never staged as
+        # a pending entry (a matrix built by `from_dense`, or one that was
+        # scaled after assembly); `MatZeroEntries` keeps the structure
         self._data[:] = 0.0
 
     def setPreallocationNNZ(self, nnz) -> "Mat":
@@ -284,7 +335,7 @@ class Mat:
         if self._data.size < nnz:
             self._data = np.zeros(nnz, dtype=np.float64)
             self._icol = np.zeros(nnz, dtype=np.int64)
-            self._nnz_used = nnz
+        self._nnz_used = nnz
         self._irow[:] = irow
         self._icol[:nnz] = icol
         self._data[:nnz] = vals
@@ -490,6 +541,10 @@ class Mat:
         self._materialize()
         out = self._out(x) if y is None else self._check_y(y, self._nrows)
         self._check_y(v, self._nrows)
+        if out is x:
+            raise ValueError(
+                "output y may not alias the input x in multAdd"
+            )
         out.getArray()[:] = v.getArray()
         lib().mp_mat_mult_add(
             addr(x.getArray()), addr(out.getArray()), addr(self._irow),
@@ -512,6 +567,17 @@ class Mat:
         self._materialize()
         out = self._outT(x) if y is None else self._check_y(y, self._ncols)
         self._check_y(v, self._ncols)
+        self._check_y(x, self._nrows)
+        # PCArrayAliasCheck: the transpose kernel clears `y` before it reads
+        # `x`, so upstream refuses `y is x`.
+        if out is x:
+            raise ValueError(
+                "output y may not alias the input x in multTransposeAdd"
+            )
+        if out is v:
+            # upstream allows this and adds the original v; the kernel clears
+            # its output first, so keep v in a buffer the kernel does not write
+            v = v.copy()
         out.getArray()[:] = v.getArray()
         lib().mp_mat_mult_transpose(
             addr(x.getArray()), addr(out.getArray()), addr(self._irow),

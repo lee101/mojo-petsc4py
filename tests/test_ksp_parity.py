@@ -259,3 +259,60 @@ def test_converged_reason_values_match_petscksp():
     assert Mojo.PC.Side.LEFT == Ref.PC.Side.LEFT
     assert Mojo.PC.Side.RIGHT == Ref.PC.Side.RIGHT
     assert Mojo.NormType.NORM_2 == Ref.NormType.NORM_2
+
+
+def test_bcgs_laplacian_converges_but_the_iteration_count_can_differ():
+    """Documented divergence 16.  On the 5-point Laplacian with no
+    preconditioner, BCGS can take a few more or a few fewer iterations than
+    upstream -- 160/162 at 64x64 and 301/316 at 128x128 in the published table,
+    166/172 and 322/321 here -- while converging on the same solution.  This
+    test pins that shape: same converged reason, an iterate agreeing to the
+    solver's own tolerance, a true residual at the tolerance, and an iteration
+    count close rather than necessarily equal.  If a future change makes them
+    agree exactly everywhere this fails, and the README's divergence entry
+    should go.
+    """
+    a = laplacian_2d(64)
+    n = a.shape[0]
+    b = np.random.default_rng(21).normal(size=n)
+    got, want = solve_pair(a, b, "bcgs", rtol=1e-10, max_it=2000)
+    assert got["reason"] == want["reason"] == 2
+    assert abs(got["its"] - want["its"]) <= 20
+    rel = np.linalg.norm(got["x"] - want["x"]) / np.linalg.norm(want["x"])
+    assert rel < 1e-8, f"iterates differ by {rel:g}"
+    assert true_residual(a, b, got["x"]) < 1e-7
+
+
+@pytest.mark.parametrize("restart", [10, 30])
+def test_gmres_restart_parity(restart):
+    """A restarted GMRES cycle must reach upstream's answer and iteration
+    count.  `solve_pair` builds both solvers with a PC attached, which is the
+    configuration the README documents and the benchmarks use."""
+    a = laplacian_2d(11)  # n = 121, so restart 10 and 30 both restart
+    n = a.shape[0]
+    b = np.random.default_rng(3).normal(size=n)
+
+    ksp_r, _, _ = ref_solver(a)
+    ksp_r.setType("gmres")
+    ksp_r.setGMRESRestart(restart)
+    ksp_r.setTolerances(rtol=1e-10, atol=ATOL, divtol=1e30, max_it=2000)
+    br = Ref.Vec().createSeq(n)
+    br.setArray(b)
+    xr = Ref.Vec().createSeq(n)
+    ksp_r.solve(br, xr)
+
+    ksp_m, _, _ = mojo_solver(a)
+    ksp_m.setType("gmres")
+    ksp_m.setGMRESRestart(restart)
+    ksp_m.setTolerances(rtol=1e-10, atol=ATOL, divtol=1e30, max_it=2000)
+    bm = Mojo.Vec().createSeq(n)
+    bm.setArray(b)
+    xm = Mojo.Vec().createSeq(n)
+    ksp_m.solve(bm, xm)
+
+    assert ksp_m.getIterationNumber() == ksp_r.getIterationNumber()
+    assert int(ksp_m.getConvergedReason()) == int(ksp_r.getConvergedReason())
+    np.testing.assert_allclose(
+        xm.getArray(), xr.getArray(), rtol=1e-6, atol=1e-8
+    )
+    assert true_residual(a, b, xm.getArray()) < 1e-6
